@@ -7,8 +7,7 @@ use chrono::{Duration, Utc};
 use libtumpa::{
     decrypt, encrypt, key,
     sign::{self, Secret, SecretRequest, SignBackend},
-    store, verify,
-    KeyStore, Passphrase, SubkeyFlags,
+    store, verify, KeyStore, Passphrase, SubkeyFlags,
 };
 
 fn in_memory_store() -> KeyStore {
@@ -41,11 +40,9 @@ fn full_software_workflow() {
 
     // Sign via high-level dispatch (software, because no card).
     let (raw, key_info) = store.get_key(&fp).unwrap();
-    let (signature, backend) = sign::sign_detached(&raw, &key_info, b"payload", |req| {
-        match req {
-            SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
-            SecretRequest::CardPin { .. } => panic!("unexpected card path"),
-        }
+    let (signature, backend) = sign::sign_detached(&raw, &key_info, b"payload", |req| match req {
+        SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+        SecretRequest::CardPin { .. } => panic!("unexpected card path"),
     })
     .unwrap();
     assert_eq!(backend, SignBackend::Software);
@@ -78,16 +75,29 @@ fn uid_lifecycle() {
     )
     .unwrap();
 
-    let info = key::add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("pw")).unwrap();
+    let info = key::add_uid(
+        &store,
+        &info.fingerprint,
+        "Alice 2 <a2@example.com>",
+        &pw("pw"),
+    )
+    .unwrap();
     assert_eq!(info.user_ids.len(), 2);
 
-    let info = key::revoke_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("pw")).unwrap();
-    assert!(info
-        .user_ids
-        .iter()
-        .find(|u| u.value == "Alice 2 <a2@example.com>")
-        .unwrap()
-        .revoked);
+    let info = key::revoke_uid(
+        &store,
+        &info.fingerprint,
+        "Alice 2 <a2@example.com>",
+        &pw("pw"),
+    )
+    .unwrap();
+    assert!(
+        info.user_ids
+            .iter()
+            .find(|u| u.value == "Alice 2 <a2@example.com>")
+            .unwrap()
+            .revoked
+    );
 }
 
 #[test]

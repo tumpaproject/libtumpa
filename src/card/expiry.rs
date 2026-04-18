@@ -79,9 +79,13 @@ pub fn update_selected_subkeys_expiry_on_card(
         .export_key_armored(key_fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))?;
 
-    let updated =
-        update_subkeys_expiry_on_card(armored.as_bytes(), subkey_fingerprints, seconds, pin.as_slice())
-            .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?;
+    let updated = update_subkeys_expiry_on_card(
+        armored.as_bytes(),
+        subkey_fingerprints,
+        seconds,
+        pin.as_slice(),
+    )
+    .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?;
 
     store
         .update_key(key_fingerprint, &updated)

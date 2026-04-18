@@ -275,15 +275,10 @@ mod tests {
         let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
 
-        let (sig, backend) = sign_detached(
-            &key.secret_key,
-            &info,
-            b"hello",
-            |req| match req {
-                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
-                SecretRequest::CardPin { .. } => panic!("no card, should not request PIN"),
-            },
-        )
+        let (sig, backend) = sign_detached(&key.secret_key, &info, b"hello", |req| match req {
+            SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+            SecretRequest::CardPin { .. } => panic!("no card, should not request PIN"),
+        })
         .unwrap();
         assert!(sig.contains("BEGIN PGP SIGNATURE"));
         assert_eq!(backend, SignBackend::Software);
@@ -320,13 +315,9 @@ mod tests {
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
 
         let card_attempt = Some(Err::<String, _>(Error::Card("wrong PIN".into())));
-        let err = sign_detached_inner(
-            &key.secret_key,
-            &info,
-            b"hello",
-            card_attempt,
-            |_| Ok(Secret::Passphrase(pw("bad-passphrase"))),
-        )
+        let err = sign_detached_inner(&key.secret_key, &info, b"hello", card_attempt, |_| {
+            Ok(Secret::Passphrase(pw("bad-passphrase")))
+        })
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("card signing failed"));
@@ -362,13 +353,9 @@ mod tests {
 
         // No card attempt → software path. Closure returns a PIN instead
         // of a passphrase — must be rejected.
-        let err = sign_detached_inner(
-            &key.secret_key,
-            &info,
-            b"hello",
-            None,
-            |_| Ok(Secret::Pin(Pin::new(b"12345678".to_vec()))),
-        )
+        let err = sign_detached_inner(&key.secret_key, &info, b"hello", None, |_| {
+            Ok(Secret::Pin(Pin::new(b"12345678".to_vec())))
+        })
         .unwrap_err();
         assert!(err.to_string().contains("PIN"));
     }

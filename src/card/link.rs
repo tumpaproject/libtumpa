@@ -4,9 +4,7 @@
 //! The JSON file is intentionally **not** migrated here — the tumpa desktop
 //! `card_links.json` code never shipped, so new builds simply resync.
 
-use wecanencrypt::card::{
-    get_card_details, list_all_cards, CardInfo, CardSummary, KeySlot,
-};
+use wecanencrypt::card::{get_card_details, list_all_cards, CardInfo, CardSummary, KeySlot};
 use wecanencrypt::keystore::StoredCardKey;
 use wecanencrypt::KeyStore;
 
@@ -123,7 +121,10 @@ pub fn auto_detect(store: &KeyStore) -> Result<Vec<CardKeyDetection>> {
         for (slot, slot_fp_opt) in [
             (KeySlot::Signature, info.signature_fingerprint.as_ref()),
             (KeySlot::Encryption, info.encryption_fingerprint.as_ref()),
-            (KeySlot::Authentication, info.authentication_fingerprint.as_ref()),
+            (
+                KeySlot::Authentication,
+                info.authentication_fingerprint.as_ref(),
+            ),
         ] {
             let Some(slot_fp) = slot_fp_opt else {
                 continue;

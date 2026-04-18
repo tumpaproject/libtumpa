@@ -11,12 +11,10 @@ pub mod expiry;
 pub mod link;
 pub mod upload;
 
+pub use wecanencrypt::card::{decrypt_bytes_on_card, sign_bytes_detached_on_card};
 pub use wecanencrypt::card::{
-    find_cards_for_key, get_card_details, is_card_connected, list_all_cards, reset_card,
-    CardInfo, CardKeyMatch, CardSummary, KeySlot, TouchMode,
-};
-pub use wecanencrypt::card::{
-    decrypt_bytes_on_card, sign_bytes_detached_on_card,
+    find_cards_for_key, get_card_details, is_card_connected, list_all_cards, reset_card, CardInfo,
+    CardKeyMatch, CardSummary, KeySlot, TouchMode,
 };
 
 use crate::error::{Error, Result};

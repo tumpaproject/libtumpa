@@ -106,8 +106,9 @@ mod card_decryption {
         ciphertext: &[u8],
         pin: &Pin,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let plaintext = wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin.as_slice())
-            .map_err(|e| Error::Card(format!("decrypt_bytes_on_card: {e}")))?;
+        let plaintext =
+            wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin.as_slice())
+                .map_err(|e| Error::Card(format!("decrypt_bytes_on_card: {e}")))?;
         Ok(Zeroizing::new(plaintext))
     }
 }

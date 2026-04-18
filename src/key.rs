@@ -239,7 +239,8 @@ pub fn update_subkey_expiry(
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
 
-    let updated = update_subkeys_expiry(&cert_data, subkey_fingerprints, expiry, password.as_str())?;
+    let updated =
+        update_subkeys_expiry(&cert_data, subkey_fingerprints, expiry, password.as_str())?;
 
     store
         .update_key(fingerprint, &updated)
@@ -365,6 +366,12 @@ mod tests {
 
         change_password(&store, &info.fingerprint, &pw("old"), &pw("new")).unwrap();
         // Confirm new password now works by issuing another operation
-        add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("new")).unwrap();
+        add_uid(
+            &store,
+            &info.fingerprint,
+            "Alice 2 <a2@example.com>",
+            &pw("new"),
+        )
+        .unwrap();
     }
 }
