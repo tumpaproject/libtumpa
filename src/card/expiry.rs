@@ -8,6 +8,7 @@ use wecanencrypt::{KeyInfo, KeyStore, KeyType};
 
 use super::require_card_connected;
 use crate::error::{Error, Result};
+use crate::Pin;
 
 fn expiry_seconds_from_now(expiry: DateTime<Utc>) -> Result<u64> {
     let seconds = (expiry - Utc::now()).num_seconds();
@@ -23,7 +24,7 @@ pub fn update_key_expiry_on_card(
     store: &KeyStore,
     key_fingerprint: &str,
     expiry: DateTime<Utc>,
-    pin: &[u8],
+    pin: &Pin,
 ) -> Result<KeyInfo> {
     require_card_connected()?;
     let seconds = expiry_seconds_from_now(expiry)?;
@@ -36,7 +37,7 @@ pub fn update_key_expiry_on_card(
         .export_key_armored(key_fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))?;
 
-    let updated = update_primary_expiry_on_card(armored.as_bytes(), seconds, pin)
+    let updated = update_primary_expiry_on_card(armored.as_bytes(), seconds, pin.as_slice())
         .map_err(|e| Error::Card(format!("update_primary_expiry_on_card: {e}")))?;
 
     let subkey_fps: Vec<String> = info
@@ -50,7 +51,7 @@ pub fn update_key_expiry_on_card(
         updated
     } else {
         let fp_refs: Vec<&str> = subkey_fps.iter().map(|s| s.as_str()).collect();
-        update_subkeys_expiry_on_card(&updated, &fp_refs, seconds, pin)
+        update_subkeys_expiry_on_card(&updated, &fp_refs, seconds, pin.as_slice())
             .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?
     };
 
@@ -69,7 +70,7 @@ pub fn update_selected_subkeys_expiry_on_card(
     key_fingerprint: &str,
     subkey_fingerprints: &[&str],
     expiry: DateTime<Utc>,
-    pin: &[u8],
+    pin: &Pin,
 ) -> Result<KeyInfo> {
     require_card_connected()?;
     let seconds = expiry_seconds_from_now(expiry)?;
@@ -78,8 +79,9 @@ pub fn update_selected_subkeys_expiry_on_card(
         .export_key_armored(key_fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))?;
 
-    let updated = update_subkeys_expiry_on_card(armored.as_bytes(), subkey_fingerprints, seconds, pin)
-        .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?;
+    let updated =
+        update_subkeys_expiry_on_card(armored.as_bytes(), subkey_fingerprints, seconds, pin.as_slice())
+            .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?;
 
     store
         .update_key(key_fingerprint, &updated)

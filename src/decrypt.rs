@@ -6,6 +6,7 @@ use wecanencrypt::{KeyInfo, KeyStore};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::Passphrase;
 
 /// Key IDs a ciphertext is encrypted for.
 pub fn recipients_of(ciphertext: &[u8]) -> Result<Vec<String>> {
@@ -35,9 +36,9 @@ pub fn find_software_decryption_key(
 pub fn decrypt_with_key(
     key_data: &[u8],
     ciphertext: &[u8],
-    passphrase: &str,
+    passphrase: &Passphrase,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let plaintext = wecanencrypt::decrypt_bytes(key_data, ciphertext, passphrase)
+    let plaintext = wecanencrypt::decrypt_bytes(key_data, ciphertext, passphrase.as_str())
         .map_err(|e| Error::Decrypt(format!("decrypt_bytes: {e}")))?;
     Ok(Zeroizing::new(plaintext))
 }
@@ -45,6 +46,7 @@ pub fn decrypt_with_key(
 #[cfg(feature = "card")]
 mod card_decryption {
     use super::*;
+    use crate::Pin;
     use wecanencrypt::card::{get_card_details, list_all_cards, CardSummary};
 
     /// Describes a card that can decrypt a particular ciphertext.
@@ -102,9 +104,9 @@ mod card_decryption {
     pub fn decrypt_on_card(
         key_data: &[u8],
         ciphertext: &[u8],
-        pin: &[u8],
+        pin: &Pin,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let plaintext = wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin)
+        let plaintext = wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin.as_slice())
             .map_err(|e| Error::Card(format!("decrypt_bytes_on_card: {e}")))?;
         Ok(Zeroizing::new(plaintext))
     }
@@ -138,7 +140,8 @@ mod tests {
 
         let (key_data, info) = found.unwrap();
         assert!(info.is_secret);
-        let pt = decrypt_with_key(&key_data, &ct, "pw").unwrap();
+        let pw = Passphrase::new("pw".to_string());
+        let pt = decrypt_with_key(&key_data, &ct, &pw).unwrap();
         assert_eq!(pt.as_slice(), b"hello");
     }
 

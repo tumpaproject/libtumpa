@@ -14,15 +14,20 @@
 use wecanencrypt::KeyInfo;
 
 use crate::error::{Error, Result};
+use crate::{Passphrase, Pin};
 
 /// Sign `data` with a software secret key, producing an armored detached
 /// signature.
-pub fn sign_detached_with_key(key_data: &[u8], data: &[u8], passphrase: &str) -> Result<String> {
+pub fn sign_detached_with_key(
+    key_data: &[u8],
+    data: &[u8],
+    passphrase: &Passphrase,
+) -> Result<String> {
     if passphrase.is_empty() {
         // wecanencrypt will error, but catch it early for a clearer message.
         return Err(Error::Sign("empty passphrase".into()));
     }
-    wecanencrypt::sign_bytes_detached(key_data, data, passphrase)
+    wecanencrypt::sign_bytes_detached(key_data, data, passphrase.as_str())
         .map_err(|e| Error::Sign(format!("sign_bytes_detached: {e}")))
 }
 
@@ -50,8 +55,8 @@ mod card_signing {
     /// Sign `data` with a connected OpenPGP card, producing an armored
     /// detached signature. The card must hold a signing-capable subkey
     /// matching `key_data`.
-    pub fn sign_detached_on_card(key_data: &[u8], data: &[u8], pin: &[u8]) -> Result<String> {
-        wecanencrypt::card::sign_bytes_detached_on_card(data, key_data, pin)
+    pub fn sign_detached_on_card(key_data: &[u8], data: &[u8], pin: &Pin) -> Result<String> {
+        wecanencrypt::card::sign_bytes_detached_on_card(data, key_data, pin.as_slice())
             .map_err(|e| Error::Card(format!("sign_bytes_detached_on_card: {e}")))
     }
 }
@@ -77,6 +82,36 @@ pub enum SecretRequest<'a> {
     },
     /// Key passphrase required.
     KeyPassphrase { key_info: &'a KeyInfo },
+}
+
+/// Secret returned by the `secret` closure in [`sign_detached`].
+///
+/// The variant must match the [`SecretRequest`] variant: a `CardPin`
+/// request expects a [`Secret::Pin`], a `KeyPassphrase` request expects
+/// a [`Secret::Passphrase`]. A mismatch returns [`Error::Sign`].
+pub enum Secret {
+    Pin(Pin),
+    Passphrase(Passphrase),
+}
+
+#[cfg(feature = "card")]
+impl Secret {
+    fn into_pin(self) -> Result<Pin> {
+        match self {
+            Secret::Pin(p) => Ok(p),
+            Secret::Passphrase(_) => Err(Error::Sign(
+                "closure returned a passphrase, but a card PIN was requested".into(),
+            )),
+        }
+    }
+    fn into_passphrase(self) -> Result<Passphrase> {
+        match self {
+            Secret::Passphrase(p) => Ok(p),
+            Secret::Pin(_) => Err(Error::Sign(
+                "closure returned a PIN, but a key passphrase was requested".into(),
+            )),
+        }
+    }
 }
 
 /// Sign `data`, trying a connected card first and falling back to the
@@ -108,7 +143,7 @@ pub fn sign_detached<F>(
     mut secret: F,
 ) -> Result<(String, SignBackend)>
 where
-    F: FnMut(SecretRequest<'_>) -> Result<zeroize::Zeroizing<Vec<u8>>>,
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
     let card_attempt: Option<Result<String>> = if let Some(m) = find_signing_card(key_data)? {
         let card_ident = m.card.ident.clone();
@@ -117,6 +152,7 @@ where
                 card_ident: &card_ident,
                 key_info,
             })
+            .and_then(Secret::into_pin)
             .and_then(|pin| sign_detached_on_card(key_data, data, &pin)),
         )
     } else {
@@ -135,7 +171,7 @@ pub fn sign_detached<F>(
     mut secret: F,
 ) -> Result<(String, SignBackend)>
 where
-    F: FnMut(SecretRequest<'_>) -> Result<zeroize::Zeroizing<Vec<u8>>>,
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
     if !key_info.is_secret {
         return Err(Error::Sign(format!(
@@ -143,10 +179,15 @@ where
             key_info.fingerprint
         )));
     }
-    let pass = secret(SecretRequest::KeyPassphrase { key_info })?;
-    let pass_str = std::str::from_utf8(&pass)
-        .map_err(|_| Error::Sign("passphrase must be UTF-8".into()))?;
-    let sig = sign_detached_with_key(key_data, data, pass_str)?;
+    let pass = match secret(SecretRequest::KeyPassphrase { key_info })? {
+        Secret::Passphrase(p) => p,
+        Secret::Pin(_) => {
+            return Err(Error::Sign(
+                "closure returned a PIN, but a key passphrase was requested".into(),
+            ))
+        }
+    };
+    let sig = sign_detached_with_key(key_data, data, &pass)?;
     Ok((sig, SignBackend::Software))
 }
 
@@ -168,7 +209,7 @@ pub fn sign_detached_inner<F>(
     mut secret: F,
 ) -> Result<(String, SignBackend)>
 where
-    F: FnMut(SecretRequest<'_>) -> Result<zeroize::Zeroizing<Vec<u8>>>,
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
     let card_err: Option<Error> = match card_attempt {
         Some(Ok(sig)) => return Ok((sig, SignBackend::Card)),
@@ -190,10 +231,8 @@ where
         return Err(Error::Sign(msg));
     }
 
-    let pass = secret(SecretRequest::KeyPassphrase { key_info })?;
-    let pass_str = std::str::from_utf8(&pass)
-        .map_err(|_| Error::Sign("passphrase must be UTF-8".into()))?;
-    match sign_detached_with_key(key_data, data, pass_str) {
+    let pass = secret(SecretRequest::KeyPassphrase { key_info })?.into_passphrase()?;
+    match sign_detached_with_key(key_data, data, &pass) {
         Ok(sig) => Ok((sig, SignBackend::Software)),
         Err(sw_err) => match card_err {
             Some(c) => Err(Error::Sign(format!(
@@ -209,10 +248,14 @@ mod tests {
     use super::*;
     use wecanencrypt::{create_key_simple, parse_key_bytes};
 
+    fn pw(s: &str) -> Passphrase {
+        Passphrase::new(s.to_string())
+    }
+
     #[test]
     fn sign_and_verify_software() {
         let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
-        let sig = sign_detached_with_key(&key.secret_key, b"hello", "pw").unwrap();
+        let sig = sign_detached_with_key(&key.secret_key, b"hello", &pw("pw")).unwrap();
         assert!(sig.contains("BEGIN PGP SIGNATURE"));
 
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
@@ -237,12 +280,8 @@ mod tests {
             &info,
             b"hello",
             |req| match req {
-                SecretRequest::KeyPassphrase { .. } => {
-                    Ok(zeroize::Zeroizing::new(b"pw".to_vec()))
-                }
-                SecretRequest::CardPin { .. } => {
-                    panic!("no card, should not request PIN")
-                }
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => panic!("no card, should not request PIN"),
             },
         )
         .unwrap();
@@ -256,8 +295,6 @@ mod tests {
         let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
 
-        // Simulate: card was found and attempted, but card signing failed
-        // (e.g. wrong PIN). The software path must still succeed.
         let card_attempt = Some(Err::<String, _>(Error::Card("wrong PIN".into())));
         let (sig, backend) = sign_detached_inner(
             &key.secret_key,
@@ -265,9 +302,7 @@ mod tests {
             b"hello",
             card_attempt,
             |req| match req {
-                SecretRequest::KeyPassphrase { .. } => {
-                    Ok(zeroize::Zeroizing::new(b"pw".to_vec()))
-                }
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
                 SecretRequest::CardPin { .. } => {
                     panic!("card_attempt already consumed; should not be re-requested")
                 }
@@ -285,13 +320,12 @@ mod tests {
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
 
         let card_attempt = Some(Err::<String, _>(Error::Card("wrong PIN".into())));
-        // Software path fails because passphrase is wrong.
         let err = sign_detached_inner(
             &key.secret_key,
             &info,
             b"hello",
             card_attempt,
-            |_| Ok(zeroize::Zeroizing::new(b"bad-passphrase".to_vec())),
+            |_| Ok(Secret::Passphrase(pw("bad-passphrase"))),
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -303,7 +337,6 @@ mod tests {
     #[test]
     fn card_failure_no_secret_reports_card_error() {
         let alice = create_key_simple("pw", &["Alice <a@e.com>"]).unwrap();
-        // Strip the secret to simulate a public-only key in the store.
         let info = parse_key_bytes(alice.public_key.as_bytes(), true).unwrap();
         assert!(!info.is_secret);
 
@@ -319,5 +352,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no software secret key available"));
         assert!(msg.contains("card path failed"));
+    }
+
+    #[cfg(feature = "card")]
+    #[test]
+    fn closure_returning_wrong_secret_type_errors() {
+        let key = create_key_simple("pw", &["Alice <a@e.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        // No card attempt → software path. Closure returns a PIN instead
+        // of a passphrase — must be rejected.
+        let err = sign_detached_inner(
+            &key.secret_key,
+            &info,
+            b"hello",
+            None,
+            |_| Ok(Secret::Pin(Pin::new(b"12345678".to_vec()))),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("PIN"));
     }
 }

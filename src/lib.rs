@@ -25,41 +25,37 @@
 //! ## Secret handling
 //!
 //! libtumpa **does not own** passphrases or PINs. Every function that
-//! needs a secret borrows it (`&str` for a passphrase, `&[u8]` for a
-//! card PIN) and never copies it. It is the caller's job to keep that
-//! secret in a zeroing container and drop it promptly.
-//!
-//! The recommended pattern is:
+//! needs a secret takes `&Passphrase` or `&Pin` — both are type aliases
+//! for `Zeroizing<...>`, so the caller cannot pass a bare `String` or
+//! `Vec<u8>` by accident. The secret is borrowed for the duration of
+//! the call and the caller's `Zeroizing` container zeroes its backing
+//! memory on drop.
 //!
 //! ```no_run
-//! use zeroize::Zeroizing;
-//! # use libtumpa::{key, KeyStore};
+//! # use libtumpa::{key, KeyStore, Passphrase};
 //! # fn demo(store: &KeyStore, fp: &str) -> libtumpa::Result<()> {
-//! let password = Zeroizing::new(String::from("my-passphrase"));
+//! let password = Passphrase::new(String::from("my-passphrase"));
 //! let info = key::add_uid(store, fp, "Alice <a@example.com>", &password)?;
-//! // `password`'s backing buffer is zeroed when it drops here.
+//! // `password`'s backing buffer is zeroed when it drops at end of scope.
 //! # let _ = info;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! For card PINs use `Zeroizing<Vec<u8>>`:
+//! For card PINs use [`Pin`]:
 //!
 //! ```no_run
 //! # #[cfg(feature = "card")]
 //! # {
-//! use zeroize::Zeroizing;
-//! use libtumpa::card::admin;
-//! let admin_pin: Zeroizing<Vec<u8>> = Zeroizing::new(b"12345678".to_vec());
+//! use libtumpa::{card::admin, Pin};
+//! let admin_pin = Pin::new(b"12345678".to_vec());
 //! admin::set_cardholder_name("Alice", &admin_pin, None).ok();
 //! # }
 //! ```
 //!
-//! **Warning:** passing a bare `String` or `Vec<u8>` compiles fine but
-//! leaves the secret in process memory until the value is dropped or
-//! reallocated. Frontends that receive secrets from IPC (e.g. Tauri
-//! commands that deserialize a JSON body into `String`) **must** wrap
-//! the value in `Zeroizing` at the entry point, before calling into
+//! Frontends that receive secrets from IPC (e.g. Tauri commands that
+//! deserialize a JSON body into `String`) should wrap the value in
+//! [`Passphrase`] / [`Pin`] at the entry point, before calling into
 //! libtumpa.
 //!
 //! ## Features
@@ -89,3 +85,26 @@ pub use wecanencrypt::{
 };
 
 pub use error::{Error, Result};
+pub use zeroize::Zeroizing;
+
+/// A key passphrase.
+///
+/// Always a `Zeroizing<String>`: the backing UTF-8 buffer is overwritten
+/// with zeros when the value drops. Every libtumpa API that needs a
+/// passphrase takes `&Passphrase`, so the caller cannot accidentally pass
+/// a plain `String` that would linger in memory.
+///
+/// ```
+/// use libtumpa::Passphrase;
+/// let pw: Passphrase = Passphrase::new("my-passphrase".into());
+/// // ... use &pw ...
+/// // `pw` zeroes on drop at end of scope.
+/// ```
+pub type Passphrase = Zeroizing<String>;
+
+/// A smartcard PIN.
+///
+/// Always a `Zeroizing<Vec<u8>>`: the backing buffer is overwritten on
+/// drop. libtumpa functions that accept a card PIN require `&Pin` to
+/// force the caller into the zeroing container.
+pub type Pin = Zeroizing<Vec<u8>>;

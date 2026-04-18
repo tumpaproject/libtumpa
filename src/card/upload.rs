@@ -12,8 +12,10 @@ use wecanencrypt::{parse_key_bytes, update_password, KeyStore, KeyType};
 
 use super::{link, require_card_connected};
 use crate::error::{Error, Result};
+use crate::Passphrase;
 
-/// Default admin PIN on a freshly reset OpenPGP card.
+/// Default admin PIN on a freshly reset OpenPGP card. This is the
+/// factory constant — not a user secret — so it is a plain byte slice.
 pub const DEFAULT_ADMIN_PIN: &[u8] = b"12345678";
 
 /// Bitmask flags for [`upload`].
@@ -39,7 +41,7 @@ pub mod flags {
 pub fn upload(
     store: &KeyStore,
     key_fingerprint: &str,
-    password: &str,
+    password: &Passphrase,
     which: u8,
 ) -> Result<()> {
     require_card_connected()?;
@@ -58,7 +60,7 @@ pub fn upload(
 
     // Verify the passphrase up front — no-op password "change" proves we
     // can unlock the secret key material before we touch the card.
-    update_password(&cert_data, password, password)
+    update_password(&cert_data, password.as_str(), password.as_str())
         .map_err(|_| Error::InvalidInput("incorrect key password".into()))?;
 
     reset_card(None).map_err(|e| Error::Card(format!("reset: {e}")))?;

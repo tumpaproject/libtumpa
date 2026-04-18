@@ -6,13 +6,17 @@
 use chrono::{Duration, Utc};
 use libtumpa::{
     decrypt, encrypt, key,
-    sign::{self, SecretRequest, SignBackend},
+    sign::{self, Secret, SecretRequest, SignBackend},
     store, verify,
-    KeyStore, SubkeyFlags,
+    KeyStore, Passphrase, SubkeyFlags,
 };
 
 fn in_memory_store() -> KeyStore {
     KeyStore::open_in_memory().unwrap()
+}
+
+fn pw(s: &str) -> Passphrase {
+    Passphrase::new(s.to_string())
 }
 
 #[test]
@@ -25,7 +29,7 @@ fn full_software_workflow() {
         subkey_flags: SubkeyFlags::all(),
         ..Default::default()
     };
-    let info = key::generate_and_import(&store, params, "pw").unwrap();
+    let info = key::generate_and_import(&store, params, &pw("pw")).unwrap();
     let fp = info.fingerprint.clone();
     assert!(info.is_secret);
 
@@ -39,9 +43,7 @@ fn full_software_workflow() {
     let (raw, key_info) = store.get_key(&fp).unwrap();
     let (signature, backend) = sign::sign_detached(&raw, &key_info, b"payload", |req| {
         match req {
-            SecretRequest::KeyPassphrase { .. } => {
-                Ok(zeroize::Zeroizing::new(b"pw".to_vec()))
-            }
+            SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
             SecretRequest::CardPin { .. } => panic!("unexpected card path"),
         }
     })
@@ -59,7 +61,7 @@ fn full_software_workflow() {
     let (key_data, _) = decrypt::find_software_decryption_key(&store, &ct)
         .unwrap()
         .expect("should find secret key");
-    let pt = decrypt::decrypt_with_key(&key_data, &ct, "pw").unwrap();
+    let pt = decrypt::decrypt_with_key(&key_data, &ct, &pw("pw")).unwrap();
     assert_eq!(pt.as_slice(), b"top-secret");
 }
 
@@ -72,14 +74,14 @@ fn uid_lifecycle() {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         },
-        "pw",
+        &pw("pw"),
     )
     .unwrap();
 
-    let info = key::add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", "pw").unwrap();
+    let info = key::add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("pw")).unwrap();
     assert_eq!(info.user_ids.len(), 2);
 
-    let info = key::revoke_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", "pw").unwrap();
+    let info = key::revoke_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("pw")).unwrap();
     assert!(info
         .user_ids
         .iter()
@@ -97,12 +99,12 @@ fn expiry_updates_propagate_to_subkeys() {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         },
-        "pw",
+        &pw("pw"),
     )
     .unwrap();
 
     let new_expiry = Utc::now() + Duration::days(365);
-    let updated = key::update_expiry(&store, &info.fingerprint, new_expiry, "pw").unwrap();
+    let updated = key::update_expiry(&store, &info.fingerprint, new_expiry, &pw("pw")).unwrap();
 
     assert!(updated.expiration_time.is_some());
     for sk in &updated.subkeys {
@@ -124,7 +126,7 @@ fn availability_reflects_subkey_state() {
             },
             ..Default::default()
         },
-        "pw",
+        &pw("pw"),
     )
     .unwrap();
 
@@ -147,7 +149,7 @@ fn card_links_persist_in_card_keys_table() {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         },
-        "pw",
+        &pw("pw"),
     )
     .unwrap();
 

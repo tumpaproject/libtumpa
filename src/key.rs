@@ -16,6 +16,7 @@ use wecanencrypt::{
 };
 
 use crate::error::{Error, Result};
+use crate::Passphrase;
 
 /// Parameters for generating a new key.
 #[derive(Debug, Clone)]
@@ -48,10 +49,10 @@ impl Default for GenerateKeyParams {
 /// [`zeroize::Zeroizing`] by wecanencrypt; the caller is responsible for
 /// importing them into a keystore (or using them directly) before they go
 /// out of scope.
-pub fn generate(params: GenerateKeyParams, password: &str) -> Result<GeneratedKey> {
+pub fn generate(params: GenerateKeyParams, password: &Passphrase) -> Result<GeneratedKey> {
     let uid_refs: Vec<&str> = params.uids.iter().map(|s| s.as_str()).collect();
     let result = create_key(
-        password,
+        password.as_str(),
         &uid_refs,
         params.cipher_suite,
         None,
@@ -69,7 +70,7 @@ pub fn generate(params: GenerateKeyParams, password: &str) -> Result<GeneratedKe
 pub fn generate_and_import(
     store: &KeyStore,
     params: GenerateKeyParams,
-    password: &str,
+    password: &Passphrase,
 ) -> Result<KeyInfo> {
     let generated = generate(params, password)?;
     let fp = store
@@ -127,12 +128,12 @@ pub fn add_uid(
     store: &KeyStore,
     fingerprint: &str,
     uid: &str,
-    password: &str,
+    password: &Passphrase,
 ) -> Result<KeyInfo> {
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
-    let updated = we_add_uid(&cert_data, uid, password)?;
+    let updated = we_add_uid(&cert_data, uid, password.as_str())?;
     store
         .update_key(fingerprint, &updated)
         .map_err(|e| Error::KeyStore(format!("update_key: {e}")))?;
@@ -146,12 +147,12 @@ pub fn revoke_uid(
     store: &KeyStore,
     fingerprint: &str,
     uid: &str,
-    password: &str,
+    password: &Passphrase,
 ) -> Result<KeyInfo> {
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
-    let updated = we_revoke_uid(&cert_data, uid, password)?;
+    let updated = we_revoke_uid(&cert_data, uid, password.as_str())?;
     store
         .update_key(fingerprint, &updated)
         .map_err(|e| Error::KeyStore(format!("update_key: {e}")))?;
@@ -161,11 +162,11 @@ pub fn revoke_uid(
 }
 
 /// Revoke the primary key.
-pub fn revoke(store: &KeyStore, fingerprint: &str, password: &str) -> Result<KeyInfo> {
+pub fn revoke(store: &KeyStore, fingerprint: &str, password: &Passphrase) -> Result<KeyInfo> {
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
-    let revoked = we_revoke_key(&cert_data, password)?;
+    let revoked = we_revoke_key(&cert_data, password.as_str())?;
     store
         .update_key(fingerprint, &revoked)
         .map_err(|e| Error::KeyStore(format!("update_key: {e}")))?;
@@ -178,13 +179,13 @@ pub fn revoke(store: &KeyStore, fingerprint: &str, password: &str) -> Result<Key
 pub fn change_password(
     store: &KeyStore,
     fingerprint: &str,
-    old_password: &str,
-    new_password: &str,
+    old_password: &Passphrase,
+    new_password: &Passphrase,
 ) -> Result<()> {
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
-    let updated = update_password(&cert_data, old_password, new_password)?;
+    let updated = update_password(&cert_data, old_password.as_str(), new_password.as_str())?;
     store
         .update_key(fingerprint, &updated)
         .map_err(|e| Error::KeyStore(format!("update_key: {e}")))?;
@@ -196,13 +197,13 @@ pub fn update_expiry(
     store: &KeyStore,
     fingerprint: &str,
     expiry: DateTime<Utc>,
-    password: &str,
+    password: &Passphrase,
 ) -> Result<KeyInfo> {
     let (cert_data, info) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
 
-    let updated = update_primary_expiry(&cert_data, expiry, password)?;
+    let updated = update_primary_expiry(&cert_data, expiry, password.as_str())?;
 
     let subkey_fps: Vec<String> = info
         .subkeys
@@ -215,7 +216,7 @@ pub fn update_expiry(
         updated
     } else {
         let fp_refs: Vec<&str> = subkey_fps.iter().map(|s| s.as_str()).collect();
-        update_subkeys_expiry(&updated, &fp_refs, expiry, password)?
+        update_subkeys_expiry(&updated, &fp_refs, expiry, password.as_str())?
     };
 
     store
@@ -232,13 +233,13 @@ pub fn update_subkey_expiry(
     fingerprint: &str,
     subkey_fingerprints: &[&str],
     expiry: DateTime<Utc>,
-    password: &str,
+    password: &Passphrase,
 ) -> Result<KeyInfo> {
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
 
-    let updated = update_subkeys_expiry(&cert_data, subkey_fingerprints, expiry, password)?;
+    let updated = update_subkeys_expiry(&cert_data, subkey_fingerprints, expiry, password.as_str())?;
 
     store
         .update_key(fingerprint, &updated)
@@ -299,6 +300,10 @@ mod tests {
         KeyStore::open_in_memory().unwrap()
     }
 
+    fn pw(s: &str) -> Passphrase {
+        Passphrase::new(s.to_string())
+    }
+
     #[test]
     fn generate_import_delete_roundtrip() {
         let store = in_memory_store();
@@ -306,7 +311,7 @@ mod tests {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         };
-        let info = generate_and_import(&store, params, "pw").unwrap();
+        let info = generate_and_import(&store, params, &pw("pw")).unwrap();
         assert!(info.is_secret);
         assert_eq!(info.user_ids[0].value, "Alice <alice@example.com>");
 
@@ -321,13 +326,13 @@ mod tests {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         };
-        let info = generate_and_import(&store, params, "pw").unwrap();
+        let info = generate_and_import(&store, params, &pw("pw")).unwrap();
         let fp = info.fingerprint.clone();
 
-        let info = add_uid(&store, &fp, "Alice 2 <alice2@example.com>", "pw").unwrap();
+        let info = add_uid(&store, &fp, "Alice 2 <alice2@example.com>", &pw("pw")).unwrap();
         assert_eq!(info.user_ids.len(), 2);
 
-        let info = revoke_uid(&store, &fp, "Alice 2 <alice2@example.com>", "pw").unwrap();
+        let info = revoke_uid(&store, &fp, "Alice 2 <alice2@example.com>", &pw("pw")).unwrap();
         let revoked = info
             .user_ids
             .iter()
@@ -343,7 +348,7 @@ mod tests {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         };
-        let info = generate_and_import(&store, params, "pw").unwrap();
+        let info = generate_and_import(&store, params, &pw("pw")).unwrap();
 
         let armored = export_public_armored(&store, &info.fingerprint).unwrap();
         assert!(armored.contains("BEGIN PGP PUBLIC KEY BLOCK"));
@@ -356,10 +361,10 @@ mod tests {
             uids: vec!["Alice <alice@example.com>".into()],
             ..Default::default()
         };
-        let info = generate_and_import(&store, params, "old").unwrap();
+        let info = generate_and_import(&store, params, &pw("old")).unwrap();
 
-        change_password(&store, &info.fingerprint, "old", "new").unwrap();
+        change_password(&store, &info.fingerprint, &pw("old"), &pw("new")).unwrap();
         // Confirm new password now works by issuing another operation
-        add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", "new").unwrap();
+        add_uid(&store, &info.fingerprint, "Alice 2 <a2@example.com>", &pw("new")).unwrap();
     }
 }
