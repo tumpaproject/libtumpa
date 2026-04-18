@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. re-pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # PC/SC stack + tools required by wecanencrypt's `card` feature.
+      # pcscd actually runs (launched below with JCECARD_STORAGE_DIR) so
+      # libtumpa's card paths can talk to an emulated OpenPGP card in CI.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            pcscd \
+            libpcsclite-dev \
+            pcsc-tools
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # jcecard is an IFD handler that exposes a Java-Card-based OpenPGP
+      # card emulator through pcscd, letting us exercise real card code
+      # paths (sign_on_card, decrypt_on_card, upload, admin, expiry)
+      # without hardware. Adapted from wecanencrypt's CI.
+      - name: Install jcecard IFD handler
+        run: |
+          wget -q https://kushaldas.in/ifd-jcecard.tar.gz
+          echo "7189722f005f902fc7cee90b3cbfca30305c4195a4f083f6678de23204ccda30  ifd-jcecard.tar.gz" | sha256sum -c -
+          tar xf ifd-jcecard.tar.gz
+          cd ifd-jcecard
+          sudo ./install-jcecard.sh
+
+      - name: Start pcscd with jcecard
+        run: |
+          mkdir -p "$HOME/.jcecard"
+          # Stop any pcscd that the runner may have launched.
+          sudo systemctl stop pcscd.socket pcscd.service 2>/dev/null || true
+          sudo pkill -9 pcscd 2>/dev/null || true
+          sleep 1
+          # --disable-polkit is required on Ubuntu >=2.0.
+          sudo JCECARD_STORAGE_DIR="$HOME/.jcecard" /usr/sbin/pcscd \
+            --foreground --debug --disable-polkit > /tmp/pcscd_debug.log 2>&1 &
+          sleep 5
+          pgrep pcscd && echo "pcscd is running"
+          pcsc_scan -r
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # Build + clippy across every feature combination so conditional
+      # cfg(feature = "…") blocks don't bit-rot.
+      - name: cargo clippy (no-default-features)
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
+      - name: cargo clippy (default)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo clippy (all-features)
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+
+      # Software tests — pure cryptography and keystore paths, no card.
+      - name: cargo test (no-default-features)
+        run: cargo test --locked --no-default-features
+
+      - name: cargo test (default)
+        run: cargo test --locked
+
+      - name: cargo test (all-features)
+        run: cargo test --locked --all-features
+
+      # Card tests — anything gated behind `#[ignore]` that needs a real
+      # PC/SC reader. With jcecard running above, --ignored pulls them
+      # in. `--test-threads=1` because a card is a single serial device.
+      - name: cargo test card (ignored)
+        run: cargo test --locked --all-features -- --ignored --test-threads=1
+
+      - name: cargo doc
+        run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Upload pcscd logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pcscd-debug-log
+          path: /tmp/pcscd_debug.log
+          retention-days: 7
