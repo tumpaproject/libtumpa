@@ -148,18 +148,28 @@ where
 {
     store::ensure_key_usable_for_signing(key_info)?;
 
-    let card_attempt: Option<Result<String>> = if let Some(m) = find_signing_card(key_data)? {
-        let card_ident = m.card.ident.clone();
-        Some(
-            secret(SecretRequest::CardPin {
-                card_ident: &card_ident,
-                key_info,
-            })
-            .and_then(Secret::into_pin)
-            .and_then(|pin| sign_detached_on_card(key_data, data, &pin)),
-        )
-    } else {
-        None
+    // A failure to contact the PCSC service (e.g. pcscd not running, no
+    // reader drivers installed) means "no card visible", not "hard fail".
+    // Log and fall through to the software path.
+    let card_attempt: Option<Result<String>> = match find_signing_card(key_data) {
+        Ok(Some(m)) => {
+            let card_ident = m.card.ident.clone();
+            Some(
+                secret(SecretRequest::CardPin {
+                    card_ident: &card_ident,
+                    key_info,
+                })
+                .and_then(Secret::into_pin)
+                .and_then(|pin| sign_detached_on_card(key_data, data, &pin)),
+            )
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::info!(
+                "could not enumerate smartcards ({e}); skipping card path, using software key"
+            );
+            None
+        }
     };
 
     sign_detached_inner(key_data, key_info, data, card_attempt, secret)
@@ -404,5 +414,31 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("PIN"));
+    }
+
+    /// PCSC unavailable (pcscd not running, no reader) must degrade to
+    /// the software path, not hard-fail the sign. Regression guard for
+    /// the tumpa-cli CI failure where `Failed to create a pcsc smartcard
+    /// context` bubbled all the way out of tclig.
+    #[cfg(feature = "card")]
+    #[test]
+    fn pcsc_error_falls_back_to_software() {
+        let key = create_key_simple("pw", &["Alice <a@e.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        // Simulate the shape of the CI error: card_attempt is `None`
+        // because the outer `sign_detached` converted the PCSC error
+        // into "no card" via the new match arm. The software path
+        // must still succeed with a good passphrase.
+        let (sig, backend) =
+            sign_detached_inner(&key.secret_key, &info, b"hello", None, |req| match req {
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => {
+                    panic!("card path should be skipped when PCSC is unavailable")
+                }
+            })
+            .unwrap();
+        assert!(sig.contains("BEGIN PGP SIGNATURE"));
+        assert_eq!(backend, SignBackend::Software);
     }
 }

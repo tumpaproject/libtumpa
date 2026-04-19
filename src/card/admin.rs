@@ -18,9 +18,11 @@ pub const ADMIN_PIN_MIN_LEN: usize = 8;
 /// Set the cardholder name (ISO 7816-6). Requires the admin PIN.
 ///
 /// `ident` selects which card to target. When `None`, libtumpa requires
-/// that exactly one card be connected (see
-/// [`super::require_safe_implicit_card_target`]); pass the card ident
-/// explicitly when multiple cards are present.
+/// that exactly one card be connected — calling a card operation with
+/// `ident = None` while multiple cards are plugged in is rejected
+/// rather than silently targeting whichever card the PCSC layer picks
+/// up first. Pass the card ident explicitly when multiple cards are
+/// present.
 pub fn set_cardholder_name(name: &str, admin_pin: &Pin, ident: Option<&str>) -> Result<()> {
     require_safe_implicit_card_target(ident)?;
     we_set_name(name, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
