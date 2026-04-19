@@ -6,7 +6,7 @@ use wecanencrypt::card::{
     set_public_key_url as we_set_url, set_touch_mode as we_set_touch, KeySlot, TouchMode,
 };
 
-use super::require_card_connected;
+use super::require_safe_implicit_card_target;
 use crate::error::{Error, Result};
 use crate::Pin;
 
@@ -16,14 +16,22 @@ pub const USER_PIN_MIN_LEN: usize = 6;
 pub const ADMIN_PIN_MIN_LEN: usize = 8;
 
 /// Set the cardholder name (ISO 7816-6). Requires the admin PIN.
+///
+/// `ident` selects which card to target. When `None`, libtumpa requires
+/// that exactly one card be connected (see
+/// [`super::require_safe_implicit_card_target`]); pass the card ident
+/// explicitly when multiple cards are present.
 pub fn set_cardholder_name(name: &str, admin_pin: &Pin, ident: Option<&str>) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     we_set_name(name, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
 }
 
 /// Set the URL of the public key on the card. Requires the admin PIN.
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`] for
+/// multi-card semantics.
 pub fn set_public_key_url(url: &str, admin_pin: &Pin, ident: Option<&str>) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     we_set_url(url, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
 }
 
@@ -31,8 +39,11 @@ pub fn set_public_key_url(url: &str, admin_pin: &Pin, ident: Option<&str>) -> Re
 ///
 /// (The underlying card command verifies the admin PIN and sets a new user
 /// PIN in one shot; tumpa's UI exposes it as "change user PIN using admin".)
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`] for
+/// multi-card semantics.
 pub fn change_user_pin(admin_pin: &Pin, new_pin: &Pin, ident: Option<&str>) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     if new_pin.len() < USER_PIN_MIN_LEN {
         return Err(Error::InvalidInput(format!(
             "user PIN must be at least {USER_PIN_MIN_LEN} characters"
@@ -43,8 +54,11 @@ pub fn change_user_pin(admin_pin: &Pin, new_pin: &Pin, ident: Option<&str>) -> R
 }
 
 /// Change the admin PIN. Requires the current admin PIN.
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`] for
+/// multi-card semantics.
 pub fn change_admin_pin(current_pin: &Pin, new_pin: &Pin, ident: Option<&str>) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     if new_pin.len() < ADMIN_PIN_MIN_LEN {
         return Err(Error::InvalidInput(format!(
             "admin PIN must be at least {ADMIN_PIN_MIN_LEN} characters"
@@ -63,8 +77,11 @@ pub struct SlotTouchMode {
 
 /// Return the current touch modes for the signing / encryption / authentication
 /// slots. `None` for a slot means the card does not support touch policies there.
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`] for
+/// multi-card semantics.
 pub fn get_touch_modes(ident: Option<&str>) -> Result<Vec<SlotTouchMode>> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     let (sig, enc, auth) = we_get_touch_modes(ident).map_err(|e| Error::Card(e.to_string()))?;
     Ok(vec![
         SlotTouchMode {
@@ -83,12 +100,15 @@ pub fn get_touch_modes(ident: Option<&str>) -> Result<Vec<SlotTouchMode>> {
 }
 
 /// Set the touch mode for a slot. Requires the admin PIN.
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`] for
+/// multi-card semantics.
 pub fn set_touch_mode(
     slot: KeySlot,
     mode: TouchMode,
     admin_pin: &Pin,
     ident: Option<&str>,
 ) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     we_set_touch(slot, mode, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
 }

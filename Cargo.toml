@@ -15,7 +15,7 @@ card = ["wecanencrypt/card"]
 network = ["wecanencrypt/network", "dep:reqwest", "dep:serde_json"]
 
 [dependencies]
-wecanencrypt = { version = "0.10.0", features = ["keystore"] }
+wecanencrypt = { version = "0.11.0", features = ["keystore"] }
 # Pinned to the same pgp version used by wecanencrypt so that
 # DetachedSignature parsing agrees between both crates.
 pgp = "0.19"

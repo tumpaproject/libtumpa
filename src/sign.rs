@@ -14,6 +14,7 @@
 use wecanencrypt::KeyInfo;
 
 use crate::error::{Error, Result};
+use crate::store;
 use crate::{Passphrase, Pin};
 
 /// Sign `data` with a software secret key, producing an armored detached
@@ -145,6 +146,8 @@ pub fn sign_detached<F>(
 where
     F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
+    store::ensure_key_usable_for_signing(key_info)?;
+
     let card_attempt: Option<Result<String>> = if let Some(m) = find_signing_card(key_data)? {
         let card_ident = m.card.ident.clone();
         Some(
@@ -173,6 +176,8 @@ pub fn sign_detached<F>(
 where
     F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
+    store::ensure_key_usable_for_signing(key_info)?;
+
     if !key_info.is_secret {
         return Err(Error::Sign(format!(
             "no secret key available for {}",
@@ -246,7 +251,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wecanencrypt::{create_key_simple, parse_key_bytes};
+    use chrono::{Duration, Utc};
+    use wecanencrypt::{create_key, create_key_simple, parse_key_bytes, revoke_key, CipherSuite, SubkeyFlags};
 
     fn pw(s: &str) -> Passphrase {
         Passphrase::new(s.to_string())
@@ -282,6 +288,44 @@ mod tests {
         .unwrap();
         assert!(sig.contains("BEGIN PGP SIGNATURE"));
         assert_eq!(backend, SignBackend::Software);
+    }
+
+    #[test]
+    fn sign_detached_rejects_revoked_key() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let revoked = revoke_key(&key.secret_key, "pw").unwrap();
+        let info = parse_key_bytes(&revoked, true).unwrap();
+
+        let err = sign_detached(&revoked, &info, b"hello", |_| {
+            Ok(Secret::Passphrase(pw("pw")))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::UnusableKey { .. }));
+    }
+
+    #[test]
+    fn sign_detached_rejects_expired_key() {
+        let creation_time = Utc::now() - Duration::days(3);
+        let expiry = Utc::now() - Duration::days(1);
+        let key = create_key(
+            "pw",
+            &["Alice <alice@example.com>"],
+            CipherSuite::Cv25519,
+            Some(creation_time),
+            Some(expiry),
+            Some(expiry),
+            SubkeyFlags::all(),
+            false,
+            true,
+        )
+        .unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        let err = sign_detached(&key.secret_key, &info, b"hello", |_| {
+            Ok(Secret::Passphrase(pw("pw")))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::UnusableKey { .. }));
     }
 
     #[cfg(feature = "card")]

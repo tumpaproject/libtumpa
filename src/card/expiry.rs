@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use wecanencrypt::card::{update_primary_expiry_on_card, update_subkeys_expiry_on_card};
 use wecanencrypt::{KeyInfo, KeyStore, KeyType};
 
-use super::require_card_connected;
+use super::require_safe_implicit_card_target;
 use crate::error::{Error, Result};
 use crate::Pin;
 
@@ -20,13 +20,19 @@ fn expiry_seconds_from_now(expiry: DateTime<Utc>) -> Result<u64> {
 
 /// Update the primary key and every non-certification subkey expiry, using
 /// the card's signing/authentication key as the signer (PIN-gated).
+///
+/// Because the upstream card-signing expiry helpers are not card-ident aware,
+/// this function refuses to run while multiple cards are connected. Pass
+/// `ident` when the caller wants to assert which single connected card is
+/// expected.
 pub fn update_key_expiry_on_card(
     store: &KeyStore,
     key_fingerprint: &str,
     expiry: DateTime<Utc>,
     pin: &Pin,
+    ident: Option<&str>,
 ) -> Result<KeyInfo> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     let seconds = expiry_seconds_from_now(expiry)?;
 
     let (_cert_data, info) = store
@@ -71,8 +77,9 @@ pub fn update_selected_subkeys_expiry_on_card(
     subkey_fingerprints: &[&str],
     expiry: DateTime<Utc>,
     pin: &Pin,
+    ident: Option<&str>,
 ) -> Result<KeyInfo> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
     let seconds = expiry_seconds_from_now(expiry)?;
 
     let armored = store

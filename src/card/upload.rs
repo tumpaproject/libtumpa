@@ -10,7 +10,7 @@ use wecanencrypt::card::{
 };
 use wecanencrypt::{parse_key_bytes, update_password, KeyStore, KeyType};
 
-use super::{link, require_card_connected};
+use super::{link, require_safe_implicit_card_target};
 use crate::error::{Error, Result};
 use crate::Passphrase;
 
@@ -38,13 +38,25 @@ pub mod flags {
 /// table via [`link::auto_link_after_upload`].
 ///
 /// `which` is a bitmask from [`flags`].
+///
+/// Because the upstream upload helpers are not card-ident aware, this
+/// function refuses to run while multiple cards are connected. Pass `ident`
+/// when the caller wants to assert which card is expected; libtumpa will
+/// verify that card is the only connected card before proceeding.
 pub fn upload(
     store: &KeyStore,
     key_fingerprint: &str,
     password: &Passphrase,
     which: u8,
+    ident: Option<&str>,
 ) -> Result<()> {
-    require_card_connected()?;
+    require_safe_implicit_card_target(ident)?;
+
+    if which == 0 {
+        return Err(Error::InvalidInput(
+            "must select at least one slot to upload".into(),
+        ));
+    }
 
     if which & flags::PRIMARY_TO_SIGNING != 0 && which & flags::SIGNING_SUBKEY != 0 {
         return Err(Error::InvalidInput(
@@ -58,12 +70,36 @@ pub fn upload(
 
     let cert_info = parse_key_bytes(&cert_data, true)?;
 
+    if which & flags::SIGNING_SUBKEY != 0 {
+        cert_info
+            .subkeys
+            .iter()
+            .find(|sk| matches!(sk.key_type, KeyType::Signing))
+            .ok_or_else(|| Error::InvalidInput("no signing subkey found".into()))?;
+    }
+
+    if which & flags::ENCRYPTION != 0 {
+        cert_info
+            .subkeys
+            .iter()
+            .find(|sk| matches!(sk.key_type, KeyType::Encryption))
+            .ok_or_else(|| Error::InvalidInput("no encryption subkey found".into()))?;
+    }
+
+    if which & flags::AUTHENTICATION != 0 {
+        cert_info
+            .subkeys
+            .iter()
+            .find(|sk| matches!(sk.key_type, KeyType::Authentication))
+            .ok_or_else(|| Error::InvalidInput("no authentication subkey found".into()))?;
+    }
+
     // Verify the passphrase up front — no-op password "change" proves we
     // can unlock the secret key material before we touch the card.
     update_password(&cert_data, password.as_str(), password.as_str())
         .map_err(|_| Error::InvalidInput("incorrect key password".into()))?;
 
-    reset_card(None).map_err(|e| Error::Card(format!("reset: {e}")))?;
+    reset_card(ident).map_err(|e| Error::Card(format!("reset: {e}")))?;
 
     if which & flags::PRIMARY_TO_SIGNING != 0 {
         upload_primary_key_to_card(
@@ -93,12 +129,6 @@ pub fn upload(
     }
 
     if which & flags::ENCRYPTION != 0 {
-        let _ = cert_info
-            .subkeys
-            .iter()
-            .find(|sk| matches!(sk.key_type, KeyType::Encryption))
-            .ok_or_else(|| Error::InvalidInput("no encryption subkey found".into()))?;
-
         we_upload_key_to_card(
             &cert_data,
             password.as_bytes(),
@@ -126,7 +156,7 @@ pub fn upload(
     }
 
     // Best-effort auto-link after upload.
-    if let Ok(info) = get_card_details(None) {
+    if let Ok(info) = get_card_details(ident) {
         let _ = link::auto_link_after_upload(store, &info, key_fingerprint);
     }
 
