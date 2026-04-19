@@ -252,7 +252,9 @@ where
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use wecanencrypt::{create_key, create_key_simple, parse_key_bytes, revoke_key, CipherSuite, SubkeyFlags};
+    use wecanencrypt::{
+        create_key, create_key_simple, parse_key_bytes, revoke_key, CipherSuite, SubkeyFlags,
+    };
 
     fn pw(s: &str) -> Passphrase {
         Passphrase::new(s.to_string())
