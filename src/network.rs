@@ -50,11 +50,28 @@ struct VksUploadResponse {
 ///
 /// After the upload, each email address needs to be verified via the token
 /// returned by this call — see [`request_verification`].
+///
+/// This variant holds `&KeyStore` across the HTTP await, so the returned
+/// future is **not `Send`** (rusqlite's `Connection` contains `RefCell`s).
+/// If the caller needs a `Send` future — typically async Tauri commands,
+/// which require `Send` because they're dispatched through a runtime
+/// worker pool — use [`vks_upload_armored`] instead: export the armored
+/// key under the keystore lock, drop the lock, and pass the string here.
 pub async fn vks_upload(store: &KeyStore, fingerprint: &str) -> Result<VksUploadResult> {
     let armored = store
         .export_key_armored(fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))?;
+    vks_upload_armored(&armored).await
+}
 
+/// Upload an already-armored public key to keys.openpgp.org.
+///
+/// This is the `Send`-friendly counterpart to [`vks_upload`]. The caller
+/// is responsible for producing the armored text (usually via
+/// [`crate::key::export_public_armored`]) before invoking this function,
+/// which avoids keeping a `&KeyStore` (and therefore a rusqlite handle)
+/// alive across the async HTTP round-trip.
+pub async fn vks_upload_armored(armored: &str) -> Result<VksUploadResult> {
     let client = http_client()?;
     let body = serde_json::json!({ "keytext": armored });
 
