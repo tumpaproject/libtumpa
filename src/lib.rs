@@ -81,7 +81,8 @@ pub mod network;
 
 // Re-export wecanencrypt types most-used by consumers.
 pub use wecanencrypt::{
-    CipherSuite, GeneratedKey, KeyInfo, KeyStore, KeyType, SubkeyFlags, SubkeyInfo, UserIDInfo,
+    CipherSuite, GeneratedKey, KeyInfo, KeyStore, KeySummary, KeyType, SubkeyFlags, SubkeyInfo,
+    SubkeySummary, UserIDInfo, UserIdSummary,
 };
 
 pub use error::{Error, Result};

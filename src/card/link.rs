@@ -33,6 +33,32 @@ pub fn card_idents_for_key(store: &KeyStore, key_fingerprint: &str) -> Result<Ve
     Ok(idents)
 }
 
+/// Return a fingerprint → deduped card idents map for every key in
+/// the store, using one SQL query instead of one-per-key.
+///
+/// Equivalent to calling [`card_idents_for_key`] for every
+/// fingerprint returned by `KeyStore::list_fingerprints`, but
+/// collapsed into a single round trip. Intended for list-view callers
+/// (e.g. the desktop key list) that need card associations for every
+/// key at once; the per-key variant stays for detail-screen callers.
+///
+/// Per-fingerprint idents are sorted and deduplicated to match the
+/// shape of [`card_idents_for_key`].
+pub fn card_idents_map(store: &KeyStore) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let all = store
+        .list_all_card_keys()
+        .map_err(|e| Error::KeyStore(format!("list_all_card_keys: {e}")))?;
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (fingerprint, card) in all {
+        map.entry(fingerprint).or_default().push(card.card_ident);
+    }
+    for idents in map.values_mut() {
+        idents.sort();
+        idents.dedup();
+    }
+    Ok(map)
+}
+
 /// Return the full `card_keys` rows for this key (slot + slot fingerprint).
 pub fn card_associations(store: &KeyStore, key_fingerprint: &str) -> Result<Vec<StoredCardKey>> {
     store
@@ -196,5 +222,58 @@ mod tests {
 
         unlink_card(&store, &card.ident).unwrap();
         assert!(card_idents_for_key(&store, &fp).unwrap().is_empty());
+    }
+
+    /// `card_idents_map` must produce exactly the same output as
+    /// calling `card_idents_for_key` for every fingerprint in the
+    /// store, just in one SQL query instead of N.
+    #[test]
+    fn card_idents_map_matches_per_key() {
+        let store = KeyStore::open_in_memory().unwrap();
+
+        let alice = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let bob = create_key_simple("pw", &["Bob <b@example.com>"]).unwrap();
+        let fp_a = store.import_key(&alice.secret_key).unwrap();
+        let fp_b = store.import_key(&bob.secret_key).unwrap();
+
+        // Link Alice to two slots on one card AND a second card; link
+        // Bob to one slot on a different card. The map must dedup
+        // Alice's two-slots-same-card into a single ident.
+        let card_a1 = CardInfo {
+            ident: "FOO:1111".into(),
+            ..dummy_card_info()
+        };
+        let card_a2 = CardInfo {
+            ident: "FOO:2222".into(),
+            serial_number: "2222".into(),
+            ..dummy_card_info()
+        };
+        let card_b = CardInfo {
+            ident: "BAR:3333".into(),
+            serial_number: "3333".into(),
+            ..dummy_card_info()
+        };
+        link(&store, &fp_a, &card_a1, "signature", "SIGA").unwrap();
+        link(&store, &fp_a, &card_a1, "encryption", "ENCA").unwrap();
+        link(&store, &fp_a, &card_a2, "signature", "SIGA2").unwrap();
+        link(&store, &fp_b, &card_b, "signature", "SIGB").unwrap();
+
+        // Per-key reference.
+        let expected_a = card_idents_for_key(&store, &fp_a).unwrap();
+        let expected_b = card_idents_for_key(&store, &fp_b).unwrap();
+        assert_eq!(expected_a.len(), 2, "two-slots-same-card deduped to 1");
+        assert_eq!(expected_b.len(), 1);
+
+        let map = card_idents_map(&store).unwrap();
+        assert_eq!(map.get(&fp_a).cloned().unwrap_or_default(), expected_a);
+        assert_eq!(map.get(&fp_b).cloned().unwrap_or_default(), expected_b);
+        assert_eq!(map.len(), 2);
+
+        // Keys with no cards must simply be absent from the map, not
+        // present with an empty Vec.
+        let carol = create_key_simple("pw", &["Carol <c@example.com>"]).unwrap();
+        let fp_c = store.import_key(&carol.secret_key).unwrap();
+        let map2 = card_idents_map(&store).unwrap();
+        assert!(!map2.contains_key(&fp_c));
     }
 }
