@@ -1,6 +1,6 @@
 [package]
 name = "libtumpa"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Shared tumpa library: high-level OpenPGP key, card, and keystore operations on top of wecanencrypt."
@@ -18,11 +18,19 @@ include = [
 
 [features]
 default = ["card"]
-card = ["wecanencrypt/card"]
+# Desktop card support via PC/SC (libpcsclite / PCSC.framework / WinSCard).
+card = ["wecanencrypt/card-pcsc"]
+# Mobile card support. Delegates APDU I/O to a
+# `wecanencrypt::card::external` provider registered at app startup —
+# see `libtumpa::card::mobile::MobileCardBackend`.
+card-mobile = ["wecanencrypt/card-external", "dep:card-backend"]
 network = ["wecanencrypt/network", "dep:reqwest", "dep:serde_json"]
 
 [dependencies]
-wecanencrypt = { version = "0.11.0", features = ["keystore"] }
+wecanencrypt = { version = "0.12", default-features = false, features = ["keystore"] }
+# Pulled in by card-mobile so MobileCardBackend can implement the
+# CardBackend / CardTransaction traits directly.
+card-backend = { version = "0.2", optional = true }
 # Pinned to the same pgp version used by wecanencrypt so that
 # DetachedSignature parsing agrees between both crates.
 pgp = "0.19"

@@ -73,7 +73,7 @@ pub mod sign;
 pub mod store;
 pub mod verify;
 
-#[cfg(feature = "card")]
+#[cfg(any(feature = "card", feature = "card-mobile"))]
 pub mod card;
 
 #[cfg(feature = "network")]

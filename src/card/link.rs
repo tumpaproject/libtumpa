@@ -4,7 +4,9 @@
 //! The JSON file is intentionally **not** migrated here — the tumpa desktop
 //! `card_links.json` code never shipped, so new builds simply resync.
 
-use wecanencrypt::card::{get_card_details, list_all_cards, CardInfo, CardSummary, KeySlot};
+#[cfg(feature = "card")]
+use wecanencrypt::card::{get_card_details, list_all_cards};
+use wecanencrypt::card::{CardInfo, CardSummary, KeySlot};
 use wecanencrypt::keystore::StoredCardKey;
 use wecanencrypt::KeyStore;
 
@@ -95,9 +97,14 @@ pub fn auto_link_after_upload(
 
 /// Scan every connected card and report matches against the keystore.
 ///
+/// **PCSC-only.** Enumeration is a desktop concept; on mobile each
+/// card session is established explicitly via the UI, so auto-detect
+/// across multiple cards doesn't apply.
+///
 /// A match is any slot whose fingerprint equals a primary- or subkey
 /// fingerprint of a stored key (case-insensitive comparison, since card
 /// fingerprints are typically lowercase while the keystore uses uppercase).
+#[cfg(feature = "card")]
 pub fn auto_detect(store: &KeyStore) -> Result<Vec<CardKeyDetection>> {
     let cards = list_all_cards().map_err(|e| Error::Card(e.to_string()))?;
     if cards.is_empty() {
