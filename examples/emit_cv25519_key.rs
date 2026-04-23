@@ -1,5 +1,6 @@
-//! Throwaway: emit a Cv25519 (legacy) secret key to stdout (armored).
-//! Used to exercise the Nitrokey-rejection path end-to-end via tcli.
+//! Throwaway: emit a Cv25519 (legacy) secret key to stdout as raw
+//! binary bytes. Used to exercise the Nitrokey-rejection path
+//! end-to-end via tcli.
 use wecanencrypt::create_key_simple;
 
 fn main() {
