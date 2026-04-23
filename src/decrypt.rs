@@ -100,14 +100,16 @@ mod card_decryption {
         Ok(None)
     }
 
-    /// Decrypt `ciphertext` on a connected card.
+    /// Decrypt `ciphertext` on a connected card. Pass `ident` to bind to a
+    /// specific card when multiple cards are connected.
     pub fn decrypt_on_card(
         key_data: &[u8],
         ciphertext: &[u8],
         pin: &Pin,
+        ident: Option<&str>,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let plaintext =
-            wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin.as_slice())
+            wecanencrypt::card::decrypt_bytes_on_card(ciphertext, key_data, pin.as_slice(), ident)
                 .map_err(|e| Error::Card(format!("decrypt_bytes_on_card: {e}")))?;
         Ok(Zeroizing::new(plaintext))
     }

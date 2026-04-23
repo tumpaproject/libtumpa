@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "libtumpa"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "card-backend",
@@ -2431,9 +2431,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3261,9 +3261,9 @@ dependencies = [
 
 [[package]]
 name = "wecanencrypt"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c392b4898593fefa1a89b505c92104edeafdbeba8f43bcadffcb089223f25731"
+checksum = "6db92d59455fffe959ebe1f20b17a673ff78a13fea22dff07f9a8c4f492034d6"
 dependencies = [
  "aes",
  "aes-kw",
