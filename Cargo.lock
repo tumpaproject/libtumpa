@@ -3261,9 +3261,9 @@ dependencies = [
 
 [[package]]
 name = "wecanencrypt"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db92d59455fffe959ebe1f20b17a673ff78a13fea22dff07f9a8c4f492034d6"
+checksum = "e7cfdc4dff73d2367df6c91303f772884820ba36222673b6a845257c257f7128"
 dependencies = [
  "aes",
  "aes-kw",

@@ -20,6 +20,9 @@ pub enum Error {
     #[error("card error: {0}")]
     Card(String),
 
+    #[error("{card} does not support {algorithm}")]
+    CardUnsupportedAlgorithm { card: String, algorithm: String },
+
     #[error("signing failed: {0}")]
     Sign(String),
 
