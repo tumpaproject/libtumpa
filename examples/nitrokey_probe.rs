@@ -38,9 +38,7 @@ fn main() {
         let mfg = info.manufacturer.as_deref().unwrap_or("<none>");
         let name = info.manufacturer_name.as_deref().unwrap_or("<none>");
         let is_nk = mfg.eq_ignore_ascii_case("000F");
-        println!(
-            "    manufacturer={mfg}  manufacturer_name={name}  is_nitrokey={is_nk}"
-        );
+        println!("    manufacturer={mfg}  manufacturer_name={name}  is_nitrokey={is_nk}");
         found_nitrokey |= is_nk;
     }
 

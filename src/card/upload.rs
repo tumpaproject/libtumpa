@@ -76,11 +76,7 @@ fn nitrokey_upload_violation(cert_info: &KeyInfo, which: u8) -> Option<KeyAlgori
 /// Preflight: reject key algorithms that the target card's firmware is
 /// known not to accept. This runs before `reset_card` so the user's card
 /// is never wiped for an upload that would fail mid-flow.
-fn check_card_algorithm_compat(
-    ident: Option<&str>,
-    cert_info: &KeyInfo,
-    which: u8,
-) -> Result<()> {
+fn check_card_algorithm_compat(ident: Option<&str>, cert_info: &KeyInfo, which: u8) -> Result<()> {
     let Ok(card_info) = get_card_details(ident) else {
         return Ok(());
     };
