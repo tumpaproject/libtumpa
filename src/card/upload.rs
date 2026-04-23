@@ -39,10 +39,10 @@ pub mod flags {
 ///
 /// `which` is a bitmask from [`flags`].
 ///
-/// Because the upstream upload helpers are not card-ident aware, this
-/// function refuses to run while multiple cards are connected. Pass `ident`
-/// when the caller wants to assert which card is expected; libtumpa will
-/// verify that card is the only connected card before proceeding.
+/// When `ident` is `None` and multiple cards are connected, this function
+/// refuses to run; pass `ident` to disambiguate. The ident is threaded to
+/// wecanencrypt so `reset_card` and every slot upload bind to that specific
+/// card.
 pub fn upload(
     store: &KeyStore,
     key_fingerprint: &str,
@@ -107,6 +107,7 @@ pub fn upload(
             password.as_bytes(),
             CardKeySlot::Signing,
             DEFAULT_ADMIN_PIN,
+            ident,
         )
         .map_err(|e| Error::Card(format!("upload primary→signing: {e}")))?;
     }
@@ -124,6 +125,7 @@ pub fn upload(
             &sign_sk.fingerprint,
             CardKeySlot::Signing,
             DEFAULT_ADMIN_PIN,
+            ident,
         )
         .map_err(|e| Error::Card(format!("upload signing subkey: {e}")))?;
     }
@@ -134,6 +136,7 @@ pub fn upload(
             password.as_bytes(),
             CardKeySlot::Decryption,
             DEFAULT_ADMIN_PIN,
+            ident,
         )
         .map_err(|e| Error::Card(format!("upload encryption: {e}")))?;
     }
@@ -151,6 +154,7 @@ pub fn upload(
             &auth.fingerprint,
             CardKeySlot::Authentication,
             DEFAULT_ADMIN_PIN,
+            ident,
         )
         .map_err(|e| Error::Card(format!("upload authentication: {e}")))?;
     }

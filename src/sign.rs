@@ -55,9 +55,15 @@ mod card_signing {
 
     /// Sign `data` with a connected OpenPGP card, producing an armored
     /// detached signature. The card must hold a signing-capable subkey
-    /// matching `key_data`.
-    pub fn sign_detached_on_card(key_data: &[u8], data: &[u8], pin: &Pin) -> Result<String> {
-        wecanencrypt::card::sign_bytes_detached_on_card(data, key_data, pin.as_slice())
+    /// matching `key_data`. Pass `ident` to bind to a specific card when
+    /// multiple cards are connected.
+    pub fn sign_detached_on_card(
+        key_data: &[u8],
+        data: &[u8],
+        pin: &Pin,
+        ident: Option<&str>,
+    ) -> Result<String> {
+        wecanencrypt::card::sign_bytes_detached_on_card(data, key_data, pin.as_slice(), ident)
             .map_err(|e| Error::Card(format!("sign_bytes_detached_on_card: {e}")))
     }
 }
@@ -160,7 +166,7 @@ where
                     key_info,
                 })
                 .and_then(Secret::into_pin)
-                .and_then(|pin| sign_detached_on_card(key_data, data, &pin)),
+                .and_then(|pin| sign_detached_on_card(key_data, data, &pin, Some(&card_ident))),
             )
         }
         Ok(None) => None,

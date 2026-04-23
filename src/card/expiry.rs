@@ -21,10 +21,9 @@ fn expiry_seconds_from_now(expiry: DateTime<Utc>) -> Result<u64> {
 /// Update the primary key and every non-certification subkey expiry, using
 /// the card's signing/authentication key as the signer (PIN-gated).
 ///
-/// Because the upstream card-signing expiry helpers are not card-ident aware,
-/// this function refuses to run while multiple cards are connected. Pass
-/// `ident` when the caller wants to assert which single connected card is
-/// expected.
+/// When `ident` is `None` and multiple cards are connected, this function
+/// refuses to run; pass `ident` to disambiguate. The ident is threaded to
+/// wecanencrypt so the card-signing step binds to that specific card.
 pub fn update_key_expiry_on_card(
     store: &KeyStore,
     key_fingerprint: &str,
@@ -43,7 +42,7 @@ pub fn update_key_expiry_on_card(
         .export_key_armored(key_fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))?;
 
-    let updated = update_primary_expiry_on_card(armored.as_bytes(), seconds, pin.as_slice())
+    let updated = update_primary_expiry_on_card(armored.as_bytes(), seconds, pin.as_slice(), ident)
         .map_err(|e| Error::Card(format!("update_primary_expiry_on_card: {e}")))?;
 
     let subkey_fps: Vec<String> = info
@@ -57,7 +56,7 @@ pub fn update_key_expiry_on_card(
         updated
     } else {
         let fp_refs: Vec<&str> = subkey_fps.iter().map(|s| s.as_str()).collect();
-        update_subkeys_expiry_on_card(&updated, &fp_refs, seconds, pin.as_slice())
+        update_subkeys_expiry_on_card(&updated, &fp_refs, seconds, pin.as_slice(), ident)
             .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?
     };
 
@@ -91,6 +90,7 @@ pub fn update_selected_subkeys_expiry_on_card(
         subkey_fingerprints,
         seconds,
         pin.as_slice(),
+        ident,
     )
     .map_err(|e| Error::Card(format!("update_subkeys_expiry_on_card: {e}")))?;
 
