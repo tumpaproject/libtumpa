@@ -65,23 +65,32 @@ pub(crate) fn require_safe_implicit_card_target(expected_ident: Option<&str>) ->
         return Err(Error::CardNotConnected);
     }
 
-    if let Some(expected_ident) = expected_ident {
-        if !cards.iter().any(|card| card.ident == expected_ident) {
-            return Err(Error::Card(format!(
-                "card {expected_ident} is not connected"
-            )));
+    match expected_ident {
+        Some(ident) => {
+            // Caller picked the target card explicitly — that disambiguates
+            // multi-card setups, so only check that the named card is
+            // actually connected.
+            if !cards.iter().any(|card| card.ident == ident) {
+                return Err(Error::Card(format!("card {ident} is not connected")));
+            }
         }
-    }
-
-    if cards.len() > 1 {
-        let connected = cards
-            .iter()
-            .map(|card| card.ident.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::Card(format!(
-            "multiple cards connected ({connected}); disconnect all but one before upload or expiry operations"
-        )));
+        None => {
+            // No target given — refuse to guess when multiple cards are
+            // plugged in, since wecanencrypt would silently pick the first
+            // enumerated reader and a destructive op could hit the wrong
+            // card.
+            if cards.len() > 1 {
+                let connected = cards
+                    .iter()
+                    .map(|card| card.ident.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Card(format!(
+                    "multiple cards connected ({connected}); \
+                     pass an ident to pick one"
+                )));
+            }
+        }
     }
 
     Ok(())

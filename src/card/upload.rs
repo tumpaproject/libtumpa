@@ -8,7 +8,7 @@ use wecanencrypt::card::{
     get_card_details, reset_card, upload_key_to_card as we_upload_key_to_card,
     upload_primary_key_to_card, upload_subkey_by_fingerprint, CardKeySlot,
 };
-use wecanencrypt::{parse_key_bytes, update_password, KeyStore, KeyType};
+use wecanencrypt::{parse_key_bytes, update_password, KeyAlgorithm, KeyInfo, KeyStore, KeyType};
 
 use super::{link, require_safe_implicit_card_target};
 use crate::error::{Error, Result};
@@ -17,6 +17,94 @@ use crate::Passphrase;
 /// Default admin PIN on a freshly reset OpenPGP card. This is the
 /// factory constant — not a user secret — so it is a plain byte slice.
 pub const DEFAULT_ADMIN_PIN: &[u8] = b"12345678";
+
+/// OpenPGP card manufacturer code for Nitrokey GmbH (assigned in the
+/// card's Application ID).
+const NITROKEY_MANUFACTURER_CODE: &str = "000F";
+
+/// Returns true if `alg` is known to be unsupported by Nitrokey firmware.
+///
+/// Nitrokey only accepts `Cv25519Modern` (Ed25519 + X25519) among the
+/// Curve25519/448 cipher suites. `Cv25519` (legacy EdDSA + ECDH/Curve25519)
+/// and `Cv448Modern` (Ed448 + X448) are rejected here; RSA and NIST ECC
+/// fall through.
+fn is_nitrokey_unsupported(alg: KeyAlgorithm) -> bool {
+    matches!(
+        alg,
+        KeyAlgorithm::EdDsaLegacy
+            | KeyAlgorithm::EcdhCurve25519
+            | KeyAlgorithm::Ed448
+            | KeyAlgorithm::X448
+    )
+}
+
+/// Pure classifier used by [`check_card_algorithm_compat`]: given the
+/// slot selection and cert metadata, return the first algorithm that
+/// would be rejected on a Nitrokey, or `None` if the upload is allowed.
+fn nitrokey_upload_violation(cert_info: &KeyInfo, which: u8) -> Option<KeyAlgorithm> {
+    if which & flags::PRIMARY_TO_SIGNING != 0
+        && is_nitrokey_unsupported(cert_info.primary_algorithm_detail)
+    {
+        return Some(cert_info.primary_algorithm_detail);
+    }
+    let check_subkey = |kt: KeyType| -> Option<KeyAlgorithm> {
+        cert_info
+            .subkeys
+            .iter()
+            .find(|sk| sk.key_type == kt)
+            .map(|sk| sk.algorithm_detail)
+            .filter(|alg| is_nitrokey_unsupported(*alg))
+    };
+    if which & flags::SIGNING_SUBKEY != 0 {
+        if let Some(a) = check_subkey(KeyType::Signing) {
+            return Some(a);
+        }
+    }
+    if which & flags::ENCRYPTION != 0 {
+        if let Some(a) = check_subkey(KeyType::Encryption) {
+            return Some(a);
+        }
+    }
+    if which & flags::AUTHENTICATION != 0 {
+        if let Some(a) = check_subkey(KeyType::Authentication) {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// Preflight: reject key algorithms that the target card's firmware is
+/// known not to accept. This runs before `reset_card` so the user's card
+/// is never wiped for an upload that would fail mid-flow.
+///
+/// Fails closed: if we can't read the card's manufacturer (PCSC hiccup,
+/// card removed between enumeration and here, etc.), propagate the
+/// error rather than optimistically continuing into `reset_card` —
+/// otherwise a spurious read failure on a Nitrokey followed by a
+/// successful reset could still wipe a card we were trying to protect.
+fn check_card_algorithm_compat(ident: Option<&str>, cert_info: &KeyInfo, which: u8) -> Result<()> {
+    let card_info = get_card_details(ident)?;
+    let is_nitrokey = card_info
+        .manufacturer
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case(NITROKEY_MANUFACTURER_CODE))
+        .unwrap_or(false);
+    if !is_nitrokey {
+        return Ok(());
+    }
+    let card_label = card_info
+        .manufacturer_name
+        .clone()
+        .unwrap_or_else(|| "Nitrokey".to_string());
+
+    if let Some(alg) = nitrokey_upload_violation(cert_info, which) {
+        return Err(Error::CardUnsupportedAlgorithm {
+            card: card_label,
+            algorithm: alg.name().to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Bitmask flags for [`upload`].
 pub mod flags {
@@ -99,6 +187,10 @@ pub fn upload(
     update_password(&cert_data, password.as_str(), password.as_str())
         .map_err(|_| Error::InvalidInput("incorrect key password".into()))?;
 
+    // Reject unsupported algorithms before the destructive reset, so we
+    // never wipe a card for a key its firmware can't hold.
+    check_card_algorithm_compat(ident, &cert_info, which)?;
+
     reset_card(ident).map_err(|e| Error::Card(format!("reset: {e}")))?;
 
     if which & flags::PRIMARY_TO_SIGNING != 0 {
@@ -165,4 +257,72 @@ pub fn upload(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wecanencrypt::{create_key, CipherSuite, SubkeyFlags};
+
+    fn info_for(suite: CipherSuite) -> KeyInfo {
+        let key = create_key(
+            "pw",
+            &["Alice <a@e.com>"],
+            suite,
+            None,
+            None,
+            None,
+            SubkeyFlags::all(),
+            false,
+            true,
+        )
+        .unwrap();
+        parse_key_bytes(&key.secret_key, true).unwrap()
+    }
+
+    #[test]
+    fn nitrokey_allows_cv25519_modern() {
+        let info = info_for(CipherSuite::Cv25519Modern);
+        let which = flags::PRIMARY_TO_SIGNING | flags::ENCRYPTION | flags::AUTHENTICATION;
+        assert!(nitrokey_upload_violation(&info, which).is_none());
+    }
+
+    #[test]
+    fn nitrokey_allows_rsa() {
+        let info = info_for(CipherSuite::Rsa2k);
+        let which = flags::PRIMARY_TO_SIGNING | flags::ENCRYPTION | flags::AUTHENTICATION;
+        assert!(nitrokey_upload_violation(&info, which).is_none());
+    }
+
+    #[test]
+    fn nitrokey_rejects_cv25519_legacy_primary() {
+        let info = info_for(CipherSuite::Cv25519);
+        assert_eq!(
+            nitrokey_upload_violation(&info, flags::PRIMARY_TO_SIGNING),
+            Some(KeyAlgorithm::EdDsaLegacy)
+        );
+    }
+
+    #[test]
+    fn nitrokey_rejects_cv25519_legacy_encryption_subkey() {
+        let info = info_for(CipherSuite::Cv25519);
+        assert_eq!(
+            nitrokey_upload_violation(&info, flags::ENCRYPTION),
+            Some(KeyAlgorithm::EcdhCurve25519)
+        );
+    }
+
+    #[test]
+    fn nitrokey_rejects_cv448_modern() {
+        let info = info_for(CipherSuite::Cv448Modern);
+        // Ed448 surfaces first (primary), then X448 on encryption-only.
+        assert_eq!(
+            nitrokey_upload_violation(&info, flags::PRIMARY_TO_SIGNING),
+            Some(KeyAlgorithm::Ed448)
+        );
+        assert_eq!(
+            nitrokey_upload_violation(&info, flags::ENCRYPTION),
+            Some(KeyAlgorithm::X448)
+        );
+    }
 }
