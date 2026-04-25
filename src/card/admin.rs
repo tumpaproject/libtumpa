@@ -118,12 +118,10 @@ pub fn set_touch_mode(
 /// Factory-reset the connected OpenPGP card.
 ///
 /// `TERMINATE DF` on an OpenPGP card requires the admin PIN to be in
-/// the blocked state (retry counter == 0). To make the operation
-/// idempotent regardless of the current PIN, this helper first
-/// exhausts the admin-PIN retry counter with three known-wrong
-/// verifies, then issues the factory reset. After the reset the card
-/// is back to defaults: user PIN `123456`, admin PIN `12345678`, all
-/// key slots empty.
+/// the blocked state (retry counter == 0). This helper exhausts the
+/// admin-PIN retry counter with wrong-PIN verifies first, then issues
+/// the factory reset. After the reset the card is back to defaults:
+/// user PIN `123456`, admin PIN `12345678`, all key slots empty.
 ///
 /// `ident` selects which card to target; see [`set_cardholder_name`]
 /// for multi-card semantics. Because this op is destructive, calling
@@ -131,13 +129,71 @@ pub fn set_touch_mode(
 /// rather than silently targeting the first enumerated reader.
 pub fn factory_reset_card(ident: Option<&str>) -> Result<()> {
     require_safe_implicit_card_target(ident)?;
+    block_admin_pin(ident)?;
+    wecanencrypt::card::reset_card(ident).map_err(|e| Error::Card(e.to_string()))
+}
 
-    // Force the admin PIN into the blocked state. We don't care about
-    // the outcome of each verify -- each one consumes a retry
-    // regardless of whether the real admin PIN matches.
-    for _ in 0..3 {
-        let _ = wecanencrypt::card::verify_admin_pin(b"00000000", ident);
+/// Drive the admin-PIN retry counter to zero so [`factory_reset_card`]'s
+/// `TERMINATE DF` is accepted.
+///
+/// Reads the live counter from the card and loops until it hits `0`,
+/// rather than hard-coding a particular retry limit -- some cards ship
+/// with a non-3 default and an admin can configure their own. If a
+/// wrong-PIN candidate happens to match the real admin PIN, the
+/// counter won't decrement on that verify; the loop notices the
+/// no-op and rotates to a different candidate. With four obviously
+/// wrong candidates the chance of every one of them coinciding with
+/// the real admin PIN is negligible.
+fn block_admin_pin(ident: Option<&str>) -> Result<()> {
+    // PIN values to cycle through if a verify fails to consume a retry.
+    // Each is 8 bytes (the OpenPGP-card admin PIN minimum length).
+    const CANDIDATES: &[&[u8]] = &[b"00000000", b"99999999", b"01234567", b"abcdefgh"];
+
+    let mut retries = read_admin_retries(ident)?;
+    if retries == 0 {
+        return Ok(());
     }
 
-    wecanencrypt::card::reset_card(ident).map_err(|e| Error::Card(e.to_string()))
+    let mut candidate_idx = 0usize;
+    let mut stuck_rotations = 0usize;
+    while retries > 0 {
+        let pin = CANDIDATES[candidate_idx % CANDIDATES.len()];
+        // We don't act on `Ok(true)` here -- the counter is the ground
+        // truth -- but we hold onto any `Err` from the verify so a
+        // transport / APDU failure can be surfaced if the loop later
+        // gives up, instead of being silently swallowed.
+        let last_verify_err: Option<String> = wecanencrypt::card::verify_admin_pin(pin, ident)
+            .err()
+            .map(|e| e.to_string());
+
+        let new_retries = read_admin_retries(ident)?;
+        if new_retries >= retries {
+            // No retry consumed -- this candidate matched the real
+            // admin PIN, or the card refused the attempt without
+            // decrementing. Rotate to a different candidate.
+            candidate_idx += 1;
+            stuck_rotations += 1;
+            if stuck_rotations >= CANDIDATES.len() {
+                let trailer = last_verify_err
+                    .as_deref()
+                    .map(|e| format!("; last verify error: {e}"))
+                    .unwrap_or_default();
+                return Err(Error::Card(format!(
+                    "could not block admin PIN: retry counter stuck at {new_retries} \
+                     after rotating through {} known-wrong PIN candidates{trailer}",
+                    CANDIDATES.len()
+                )));
+            }
+        } else {
+            stuck_rotations = 0;
+        }
+        retries = new_retries;
+    }
+    Ok(())
+}
+
+fn read_admin_retries(ident: Option<&str>) -> Result<u8> {
+    let (_user, _reset, admin) = wecanencrypt::card::get_pin_retry_counters(ident)
+        .map_err(|e| Error::Card(e.to_string()))?;
+    Ok(admin)
 }
