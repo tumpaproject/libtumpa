@@ -29,9 +29,16 @@ pub use wecanencrypt::card::CardError as WecanencryptCardError;
 #[cfg(feature = "card-mobile")]
 pub use wecanencrypt::Error as WecanencryptError;
 
+// Note: `wecanencrypt::card::reset_card` is intentionally NOT
+// re-exported. It is destructive (TERMINATE DF + factory reset) and
+// silently targets the first enumerated reader when `ident` is `None`,
+// which would defeat the multi-card guarantee that
+// `card::admin::factory_reset_card` (the wrapped, guarded entry point)
+// is built to enforce. Consumers who need a factory reset must go
+// through the guarded wrapper.
 pub use wecanencrypt::card::{
-    decrypt_bytes_on_card, get_card_details, reset_card, sign_bytes_detached_on_card, CardInfo,
-    CardKeyMatch, CardSummary, KeySlot, TouchMode,
+    decrypt_bytes_on_card, get_card_details, sign_bytes_detached_on_card, CardInfo, CardKeyMatch,
+    CardSummary, KeySlot, TouchMode,
 };
 
 // Card enumeration is PCSC-only. Under `card-mobile` the mobile UI
