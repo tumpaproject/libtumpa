@@ -114,3 +114,30 @@ pub fn set_touch_mode(
     require_safe_implicit_card_target(ident)?;
     we_set_touch(slot, mode, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
 }
+
+/// Factory-reset the connected OpenPGP card.
+///
+/// `TERMINATE DF` on an OpenPGP card requires the admin PIN to be in
+/// the blocked state (retry counter == 0). To make the operation
+/// idempotent regardless of the current PIN, this helper first
+/// exhausts the admin-PIN retry counter with three known-wrong
+/// verifies, then issues the factory reset. After the reset the card
+/// is back to defaults: user PIN `123456`, admin PIN `12345678`, all
+/// key slots empty.
+///
+/// `ident` selects which card to target; see [`set_cardholder_name`]
+/// for multi-card semantics. Because this op is destructive, calling
+/// with `ident = None` while multiple cards are connected is rejected
+/// rather than silently targeting the first enumerated reader.
+pub fn factory_reset_card(ident: Option<&str>) -> Result<()> {
+    require_safe_implicit_card_target(ident)?;
+
+    // Force the admin PIN into the blocked state. We don't care about
+    // the outcome of each verify -- each one consumes a retry
+    // regardless of whether the real admin PIN matches.
+    for _ in 0..3 {
+        let _ = wecanencrypt::card::verify_admin_pin(b"00000000", ident);
+    }
+
+    wecanencrypt::card::reset_card(ident).map_err(|e| Error::Card(e.to_string()))
+}
