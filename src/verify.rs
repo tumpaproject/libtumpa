@@ -128,12 +128,20 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
 }
 
 /// Verify a cleartext-signed (`-----BEGIN PGP SIGNED MESSAGE-----`) message
-/// by looking the signer up in `store`.
+/// by looking the signer(s) up in `store`.
 ///
 /// Only cleartext-signed messages are supported on the keystore-lookup
 /// path. For binary or armored inline-signed messages (the kind produced
 /// by `gpg --sign` without `--clearsign`), the caller must supply the
 /// public key directly via `wecanencrypt::verify_bytes` instead.
+///
+/// **Multi-signature messages.** A cleartext-signed block may carry more
+/// than one signature. We iterate the signatures, try to resolve the
+/// signer for each, and return [`VerifyOutcome::Good`] on the *first*
+/// signature that verifies against a key in the store. Only when every
+/// signature was either by an unknown signer or failed to verify do we
+/// return [`VerifyOutcome::Bad`] (preferred) or
+/// [`VerifyOutcome::UnknownKey`] (if no signer was resolvable at all).
 pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOutcome> {
     let text = std::str::from_utf8(signed_message)
         .map_err(|_| Error::Verify("cleartext-signed message must be valid UTF-8".into()))?;
@@ -148,56 +156,82 @@ pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOu
         ));
     }
 
-    // Collect issuer IDs across all embedded signatures. Most cleartext
-    // messages have just one, but the format permits several.
-    let mut issuer_ids: Vec<String> = Vec::new();
+    // Track outcomes across all embedded signatures so that, if no
+    // signature verifies, we can still report the most useful failure
+    // shape: BAD (signer known, signature did not verify) wins over
+    // UnknownKey (no signer resolvable in the store).
+    let mut saw_issuer = false;
+    let mut first_bad: Option<KeyInfo> = None;
+    let mut first_unknown_key_id: Option<String> = None;
+
     for sig in signatures {
         let Some(cfg) = sig.config() else { continue };
+
+        let mut issuer_ids: Vec<String> = Vec::new();
         for id in store::extract_issuer_ids(cfg) {
             if !issuer_ids.contains(&id) {
                 issuer_ids.push(id);
             }
         }
+        if issuer_ids.is_empty() {
+            continue;
+        }
+        saw_issuer = true;
+
+        let lookup = store::resolve_from_issuer_ids(store, &issuer_ids)?;
+        let Some((cert_data, cert_info)) = lookup else {
+            if first_unknown_key_id.is_none() {
+                first_unknown_key_id = Some(issuer_key_id_for_display(&issuer_ids));
+            }
+            continue;
+        };
+
+        let valid = wecanencrypt::verify_bytes(&cert_data, signed_message).unwrap_or(false);
+        if valid {
+            let verifier_fp = issuer_ids
+                .iter()
+                .find(|id| id.len() == 40)
+                .cloned()
+                .unwrap_or_else(|| cert_info.fingerprint.clone())
+                .to_uppercase();
+            return Ok(VerifyOutcome::Good {
+                key_info: cert_info,
+                verifier_fingerprint: verifier_fp,
+            });
+        }
+        if first_bad.is_none() {
+            first_bad = Some(cert_info);
+        }
     }
-    if issuer_ids.is_empty() {
+
+    if !saw_issuer {
         return Err(Error::Verify(
             "cleartext-signed message has no issuer fingerprint or key ID".into(),
         ));
     }
 
-    let lookup = store::resolve_from_issuer_ids(store, &issuer_ids)?;
-    let Some((cert_data, cert_info)) = lookup else {
-        let key_id = if let Some(kid) = issuer_ids.iter().find(|id| id.len() == 16) {
-            kid.to_uppercase()
-        } else if let Some(fp) = issuer_ids.iter().find(|id| id.len() == 40) {
-            fp[24..].to_uppercase()
-        } else {
-            issuer_ids
-                .first()
-                .map(|s| s.to_uppercase())
-                .unwrap_or_default()
-        };
-        return Ok(VerifyOutcome::UnknownKey { key_id });
-    };
-
-    let valid = wecanencrypt::verify_bytes(&cert_data, signed_message).unwrap_or(false);
-
-    if valid {
-        let verifier_fp = issuer_ids
-            .iter()
-            .find(|id| id.len() == 40)
-            .cloned()
-            .unwrap_or_else(|| cert_info.fingerprint.clone())
-            .to_uppercase();
-        Ok(VerifyOutcome::Good {
-            key_info: cert_info,
-            verifier_fingerprint: verifier_fp,
-        })
+    if let Some(key_info) = first_bad {
+        Ok(VerifyOutcome::Bad { key_info })
     } else {
-        Ok(VerifyOutcome::Bad {
-            key_info: cert_info,
+        Ok(VerifyOutcome::UnknownKey {
+            key_id: first_unknown_key_id.unwrap_or_default(),
         })
     }
+}
+
+/// Pick a displayable key-id form from a list of issuer IDs (16-char key
+/// IDs, 40-char fingerprints, or hex of either).
+fn issuer_key_id_for_display(issuer_ids: &[String]) -> String {
+    if let Some(kid) = issuer_ids.iter().find(|id| id.len() == 16) {
+        return kid.to_uppercase();
+    }
+    if let Some(fp) = issuer_ids.iter().find(|id| id.len() == 40) {
+        return fp[24..].to_uppercase();
+    }
+    issuer_ids
+        .first()
+        .map(|s| s.to_uppercase())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

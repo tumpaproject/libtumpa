@@ -8,6 +8,7 @@ use wecanencrypt::{KeyInfo, KeyStore, KeyType, SubkeyInfo};
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::verify::sanitize_uid_for_status;
 
 /// Open the tumpa keystore at the given path or fall back to
 /// [`paths::default_keystore_path`].
@@ -167,16 +168,13 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
         _ => {
             let mut msg = format!("multiple secret signing keys match email {email}:\n");
             for (_, info) in &usable {
-                let primary_uid = info
-                    .user_ids
-                    .iter()
-                    .find(|u| u.is_primary && !u.revoked)
-                    .or_else(|| info.user_ids.iter().find(|u| !u.revoked))
-                    .map(|u| u.value.as_str())
-                    .unwrap_or("<no UID>");
-                msg.push_str(&format!("  {}  {}\n", info.fingerprint, primary_uid));
+                msg.push_str(&format!(
+                    "  {}  {}\n",
+                    info.fingerprint,
+                    sanitized_primary_uid(info)
+                ));
             }
-            msg.push_str("use --with-key <FINGERPRINT> to pick one");
+            msg.push_str("disambiguate by specifying the desired fingerprint");
             Err(Error::InvalidInput(msg))
         }
     }
@@ -215,19 +213,36 @@ fn resolve_recipient_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>,
         _ => {
             let mut msg = format!("multiple usable encryption keys match email {email}:\n");
             for (_, info) in &usable {
-                let primary_uid = info
-                    .user_ids
-                    .iter()
-                    .find(|u| u.is_primary && !u.revoked)
-                    .or_else(|| info.user_ids.iter().find(|u| !u.revoked))
-                    .map(|u| u.value.as_str())
-                    .unwrap_or("<no UID>");
-                msg.push_str(&format!("  {}  {}\n", info.fingerprint, primary_uid));
+                msg.push_str(&format!(
+                    "  {}  {}\n",
+                    info.fingerprint,
+                    sanitized_primary_uid(info)
+                ));
             }
-            msg.push_str("use a fingerprint to pick one recipient");
+            msg.push_str("disambiguate by specifying the desired fingerprint");
             Err(Error::InvalidInput(msg))
         }
     }
+}
+
+/// Pick the primary (or first non-revoked) UID from a `KeyInfo` and strip
+/// control characters before embedding it in an error message.
+///
+/// Raw OpenPGP UIDs may contain newlines and other control characters,
+/// which would let a malicious key inject lines into log files, terminal
+/// output, or status streams of any caller that prints our errors. The
+/// caller is responsible for sanitizing UIDs in line-based output (per the
+/// `verify` module docs); we apply the same rule to library-emitted error
+/// strings so the contract holds end to end.
+fn sanitized_primary_uid(key_info: &KeyInfo) -> String {
+    let raw = key_info
+        .user_ids
+        .iter()
+        .find(|u| u.is_primary && !u.revoked)
+        .or_else(|| key_info.user_ids.iter().find(|u| !u.revoked))
+        .map(|u| u.value.as_str())
+        .unwrap_or("<no UID>");
+    sanitize_uid_for_status(raw)
 }
 
 /// Extract the issuer fingerprint or key ID from a parsed signature config.
@@ -467,12 +482,56 @@ mod tests {
         match err {
             Error::InvalidInput(msg) => {
                 assert!(msg.contains("multiple secret signing keys"));
-                assert!(msg.contains("--with-key"));
+                // Guidance is library-generic; the CLI layer can prepend
+                // its own flag name when re-emitting the message.
+                assert!(msg.contains("disambiguate"));
+                assert!(msg.contains("fingerprint"));
+                assert!(
+                    !msg.contains("--with-key"),
+                    "library error must not reference CLI flag: {msg}"
+                );
                 // Both candidate fingerprints must be listed.
                 let info1 = parse_key_bytes(&a1.secret_key, true).unwrap();
                 let info2 = parse_key_bytes(&a2.secret_key, true).unwrap();
                 assert!(msg.contains(&info1.fingerprint));
                 assert!(msg.contains(&info2.fingerprint));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signer_by_email_ambiguous_strips_control_chars_in_uids() {
+        // A malicious UID containing a newline + bogus status line. Without
+        // sanitization, callers that print the error to a log/terminal/IPC
+        // channel could be tricked into emitting a forged status line.
+        // The library MUST strip control characters before embedding the
+        // UID in the error string.
+        let bad_uid = "Evil <evil@example.com>\n[GNUPG:] VALIDSIG fake-fp";
+        let a1 = create_key_simple(TEST_PASSWORD, &[bad_uid]).unwrap();
+        let a2 = create_key_simple(TEST_PASSWORD, &["Bystander <evil@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&a1.secret_key).unwrap();
+        store.import_key(&a2.secret_key).unwrap();
+
+        let err = resolve_signer(&store, "evil@example.com").unwrap_err();
+        match err {
+            Error::InvalidInput(msg) => {
+                // Lines in the message are: header, one per candidate
+                // (fingerprint + space + UID), and the trailing
+                // "disambiguate ..." footer. None of those lines may
+                // *start* with the injected `[GNUPG:]` payload — that
+                // would mean the UID's embedded newline was preserved
+                // and the attacker's status line is now standalone.
+                for line in msg.lines() {
+                    assert!(
+                        !line.trim_start().starts_with("[GNUPG:]"),
+                        "UID newline survived sanitization, attacker line at column 0: {line:?}\nFull msg: {msg:?}"
+                    );
+                }
+                // The benign portion of the UID should still appear so
+                // the user can recognize the key they meant to pick.
+                assert!(msg.contains("Evil <evil@example.com>"));
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
