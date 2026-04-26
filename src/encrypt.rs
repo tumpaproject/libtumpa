@@ -6,8 +6,9 @@ use crate::error::{Error, Result};
 use crate::store;
 
 /// Encrypt `plaintext` to one or more recipients, resolving each via the
-/// keystore. Recipient IDs may be fingerprints, key IDs, or subkey
-/// fingerprints (the same IDs accepted by [`store::resolve_signer`]).
+/// keystore. Recipient IDs may be fingerprints, key IDs, subkey
+/// fingerprints, or exact email addresses (the same IDs accepted by
+/// [`store::resolve_recipient`]).
 ///
 /// Every recipient is validated with [`store::ensure_key_usable_for_encryption`]
 /// before encryption.
@@ -19,7 +20,7 @@ pub fn encrypt_to_recipients(
 ) -> Result<Vec<u8>> {
     let mut key_data_list: Vec<Vec<u8>> = Vec::new();
     for id in recipients {
-        let (data, info) = store::resolve_signer(store, id)?;
+        let (data, info) = store::resolve_recipient(store, id)?;
         store::ensure_key_usable_for_encryption(&info)?;
         key_data_list.push(data);
     }
@@ -56,5 +57,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::KeyNotFound(_)));
+    }
+
+    #[test]
+    fn encrypt_by_email_allows_public_only_recipient() {
+        let alice = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(alice.public_key.as_bytes()).unwrap();
+
+        let ct = encrypt_to_recipients(&store, &["alice@example.com"], b"hello", true).unwrap();
+        let pt = wecanencrypt::decrypt_bytes(&alice.secret_key, &ct, "pw").unwrap();
+        assert_eq!(pt, b"hello");
     }
 }

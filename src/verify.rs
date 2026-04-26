@@ -22,7 +22,10 @@
 
 use std::io::Cursor;
 
-use pgp::composed::{Deserializable, DetachedSignature};
+use pgp::composed::{
+    CleartextSignedMessage, Deserializable, DetachedSignature, SignedPublicKey, SignedSecretKey,
+};
+use pgp::types::KeyDetails;
 use wecanencrypt::{KeyInfo, KeyStore};
 
 use crate::error::{Error, Result};
@@ -94,16 +97,7 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
 
     let lookup = store::resolve_from_issuer_ids(store, &issuer_ids)?;
     let Some((cert_data, cert_info)) = lookup else {
-        let key_id = if let Some(kid) = issuer_ids.iter().find(|id| id.len() == 16) {
-            kid.to_uppercase()
-        } else if let Some(fp) = issuer_ids.iter().find(|id| id.len() == 40) {
-            fp[24..].to_uppercase()
-        } else {
-            issuer_ids
-                .first()
-                .map(|s| s.to_uppercase())
-                .unwrap_or_default()
-        };
+        let key_id = issuer_key_id_for_display(&issuer_ids);
         return Ok(VerifyOutcome::UnknownKey { key_id });
     };
 
@@ -125,6 +119,167 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
             key_info: cert_info,
         })
     }
+}
+
+/// Verify a cleartext-signed (`-----BEGIN PGP SIGNED MESSAGE-----`) message
+/// by looking the signer(s) up in `store`.
+///
+/// Only cleartext-signed messages are supported on the keystore-lookup
+/// path. For binary or armored inline-signed messages (the kind produced
+/// by `gpg --sign` without `--clearsign`), the caller must supply the
+/// public key directly via `wecanencrypt::verify_bytes` instead.
+///
+/// **Multi-signature messages.** A cleartext-signed block may carry more
+/// than one signature. We iterate the signatures, try to resolve the
+/// signer for each, and return [`VerifyOutcome::Good`] on the *first*
+/// signature that verifies against a key in the store. Only when every
+/// signature was either by an unknown signer or failed to verify do we
+/// return [`VerifyOutcome::Bad`] (preferred) or
+/// [`VerifyOutcome::UnknownKey`] (if no signer was resolvable at all).
+pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOutcome> {
+    let text = std::str::from_utf8(signed_message)
+        .map_err(|_| Error::Verify("cleartext-signed message must be valid UTF-8".into()))?;
+
+    let (msg, _) = CleartextSignedMessage::from_string(text)
+        .map_err(|e| Error::Verify(format!("failed to parse cleartext-signed message: {e}")))?;
+
+    let signatures = msg.signatures();
+    if signatures.is_empty() {
+        return Err(Error::Verify(
+            "cleartext-signed message has no signature".into(),
+        ));
+    }
+    let normalized_text = msg.signed_text();
+
+    // Track outcomes across all embedded signatures so that, if no
+    // signature verifies, we can still report the most useful failure
+    // shape: BAD (signer known, signature did not verify) wins over
+    // UnknownKey (no signer resolvable in the store).
+    let mut saw_issuer = false;
+    let mut first_bad: Option<KeyInfo> = None;
+    let mut first_unknown_key_id: Option<String> = None;
+
+    for sig in signatures {
+        let Some(cfg) = sig.config() else { continue };
+
+        let mut issuer_ids: Vec<String> = Vec::new();
+        for id in store::extract_issuer_ids(cfg) {
+            if !issuer_ids.contains(&id) {
+                issuer_ids.push(id);
+            }
+        }
+        if issuer_ids.is_empty() {
+            continue;
+        }
+        saw_issuer = true;
+
+        let lookup = store::resolve_from_issuer_ids(store, &issuer_ids)?;
+        let Some((cert_data, cert_info)) = lookup else {
+            if first_unknown_key_id.is_none() {
+                first_unknown_key_id = Some(issuer_key_id_for_display(&issuer_ids));
+            }
+            continue;
+        };
+
+        let cert = parse_verifying_cert(&cert_data)?;
+        if verify_signature_with_cert(&cert, &issuer_ids, sig, normalized_text.as_bytes()) {
+            let verifier_fp = issuer_ids
+                .iter()
+                .find(|id| id.len() == 40)
+                .cloned()
+                .unwrap_or_else(|| cert_info.fingerprint.clone())
+                .to_uppercase();
+            return Ok(VerifyOutcome::Good {
+                key_info: cert_info,
+                verifier_fingerprint: verifier_fp,
+            });
+        }
+        if first_bad.is_none() {
+            first_bad = Some(cert_info);
+        }
+    }
+
+    if !saw_issuer {
+        return Err(Error::Verify(
+            "cleartext-signed message has no issuer fingerprint or key ID".into(),
+        ));
+    }
+
+    if let Some(key_info) = first_bad {
+        Ok(VerifyOutcome::Bad { key_info })
+    } else {
+        Ok(VerifyOutcome::UnknownKey {
+            key_id: first_unknown_key_id.unwrap_or_default(),
+        })
+    }
+}
+
+/// Pick a displayable key-id form from a list of issuer IDs (16-char key
+/// IDs, 40-char fingerprints, or hex of either).
+fn issuer_key_id_for_display(issuer_ids: &[String]) -> String {
+    if let Some(kid) = issuer_ids.iter().find(|id| id.len() == 16) {
+        return kid.to_uppercase();
+    }
+    if let Some(fp) = issuer_ids.iter().find(|id| id.len() == 40) {
+        return fp[24..].to_uppercase();
+    }
+    issuer_ids
+        .first()
+        .map(|s| s.to_uppercase())
+        .unwrap_or_default()
+}
+
+/// Parse a stored cert into a `SignedPublicKey` for signature verification.
+///
+/// The wecanencrypt keystore preserves whatever bytes were originally
+/// imported — `import_key(armored_string.as_bytes())` round-trips as
+/// armored, `import_key(binary_secret)` round-trips as binary. We must
+/// handle both, for both public-only and secret-bearing entries.
+fn parse_verifying_cert(cert_data: &[u8]) -> Result<SignedPublicKey> {
+    if let Ok((cert, _headers)) = SignedPublicKey::from_armor_single(Cursor::new(cert_data)) {
+        return Ok(cert);
+    }
+    if let Ok((cert, _headers)) = SignedPublicKey::from_reader_single(Cursor::new(cert_data)) {
+        return Ok(cert);
+    }
+    if let Ok((secret, _headers)) = SignedSecretKey::from_armor_single(Cursor::new(cert_data)) {
+        return Ok(secret.into());
+    }
+
+    let (secret, _headers) = SignedSecretKey::from_reader_single(Cursor::new(cert_data))
+        .map_err(|e| Error::KeyStore(format!("failed to parse signer cert from keystore: {e}")))?;
+    Ok(secret.into())
+}
+
+fn verify_signature_with_cert(
+    cert: &SignedPublicKey,
+    issuer_ids: &[String],
+    sig: &pgp::packet::Signature,
+    normalized_text: &[u8],
+) -> bool {
+    if issuer_matches_key(
+        issuer_ids,
+        &hex::encode(cert.primary_key.fingerprint().as_bytes()).to_uppercase(),
+        &hex::encode(cert.primary_key.legacy_key_id()).to_uppercase(),
+    ) && sig.verify(&cert.primary_key, normalized_text).is_ok()
+    {
+        return true;
+    }
+
+    cert.public_subkeys.iter().any(|subkey| {
+        issuer_matches_key(
+            issuer_ids,
+            &hex::encode(subkey.fingerprint().as_bytes()).to_uppercase(),
+            &hex::encode(subkey.legacy_key_id()).to_uppercase(),
+        ) && sig.verify(subkey, normalized_text).is_ok()
+    })
+}
+
+fn issuer_matches_key(issuer_ids: &[String], fingerprint: &str, key_id: &str) -> bool {
+    issuer_ids.iter().any(|id| {
+        let id = id.to_uppercase();
+        id == fingerprint || id == key_id
+    })
 }
 
 #[cfg(test)]
@@ -183,5 +338,81 @@ mod tests {
         // Verify against different data
         let outcome = verify_detached(&store, b"tampered", sig.as_bytes()).unwrap();
         assert!(matches!(outcome, VerifyOutcome::Bad { .. }));
+    }
+
+    #[test]
+    fn verify_inline_good() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&key.secret_key).unwrap();
+
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let outcome = verify_inline(&store, &signed).unwrap();
+        match outcome {
+            VerifyOutcome::Good { key_info, .. } => {
+                assert!(key_info
+                    .user_ids
+                    .iter()
+                    .any(|u| u.value.contains("alice@example.com")));
+            }
+            other => panic!("expected Good, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_inline_good_with_armored_public_only_cert() {
+        // Common path when a user runs `gpg --import` of an armored public
+        // key: wecanencrypt stores the armored bytes verbatim. `verify_inline`
+        // must therefore handle armored cert bytes (not just binary).
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(key.public_key.as_bytes()).unwrap();
+
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let outcome = verify_inline(&store, &signed).unwrap();
+        assert!(
+            matches!(outcome, VerifyOutcome::Good { .. }),
+            "verify_inline must accept armored public-only certs from the keystore: got {outcome:?}",
+        );
+    }
+
+    #[test]
+    fn verify_inline_unknown_key() {
+        let alice = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        // Alice's key is NOT imported.
+
+        let signed =
+            wecanencrypt::sign_bytes_cleartext(&alice.secret_key, b"hello\n", "pw").unwrap();
+        let outcome = verify_inline(&store, &signed).unwrap();
+        assert!(matches!(outcome, VerifyOutcome::UnknownKey { .. }));
+    }
+
+    #[test]
+    fn verify_inline_bad_signature() {
+        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&key.secret_key).unwrap();
+
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        // Tamper the signed text inside the cleartext block. Replace
+        // "hello" with "HELLO" — payload region only, signature block
+        // untouched, so the parser still accepts it but verification
+        // must fail.
+        let mut tampered = signed.clone();
+        if let Some(pos) = tampered.windows(5).position(|w| w == b"hello") {
+            tampered[pos..pos + 5].copy_from_slice(b"HELLO");
+        } else {
+            panic!("test fixture: did not find 'hello' to tamper");
+        }
+        let outcome = verify_inline(&store, &tampered).unwrap();
+        assert!(matches!(outcome, VerifyOutcome::Bad { .. }));
+    }
+
+    #[test]
+    fn verify_inline_rejects_non_cleartext() {
+        let store = KeyStore::open_in_memory().unwrap();
+        let err = verify_inline(&store, b"this is not a cleartext signed message").unwrap_err();
+        assert!(matches!(err, Error::Verify(_)));
     }
 }
