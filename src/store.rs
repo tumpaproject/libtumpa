@@ -116,9 +116,14 @@ pub fn resolve_recipient(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo
 /// capability), and return the unique match. Errors with a list of
 /// candidates if more than one key matches.
 fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, KeyInfo)> {
+    // `email` is untrusted user input. Sanitize before embedding it in
+    // any error string: a newline in `email` would let the caller's log
+    // or status-stream consumer see attacker-controlled lines.
+    let safe_email = sanitize_for_error(email);
+
     let candidates = store
         .search_by_email(email)
-        .map_err(|e| Error::KeyStore(format!("search_by_email({email}): {e}")))?;
+        .map_err(|e| Error::KeyStore(format!("search_by_email({safe_email}): {e}")))?;
 
     let mut usable: Vec<(Vec<u8>, KeyInfo)> = Vec::new();
     for info in candidates {
@@ -134,7 +139,7 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
             Ok((data, info)) => usable.push((data, info)),
             Err(e) => {
                 return Err(Error::KeyStore(format!(
-                    "resolve_signer_by_email({email}): get_key({}) failed after search hit: {e}",
+                    "resolve_signer_by_email({safe_email}): get_key({}) failed after search hit: {e}",
                     info.fingerprint
                 )));
             }
@@ -143,11 +148,11 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
 
     match usable.len() {
         0 => Err(Error::KeyNotFound(format!(
-            "no usable secret signing key found for email {email}"
+            "no usable secret signing key found for email {safe_email}"
         ))),
         1 => Ok(usable.into_iter().next().unwrap()),
         _ => {
-            let mut msg = format!("multiple secret signing keys match email {email}:\n");
+            let mut msg = format!("multiple secret signing keys match email {safe_email}:\n");
             for (_, info) in &usable {
                 msg.push_str(&format!(
                     "  {}  {}\n",
@@ -166,9 +171,12 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
 /// non-revoked/non-expired, encryption capability), and return the unique
 /// match. Errors with a list of candidates if more than one key matches.
 fn resolve_recipient_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, KeyInfo)> {
+    // See `resolve_signer_by_email` for why we sanitize `email`.
+    let safe_email = sanitize_for_error(email);
+
     let candidates = store
         .search_by_email(email)
-        .map_err(|e| Error::KeyStore(format!("search_by_email({email}): {e}")))?;
+        .map_err(|e| Error::KeyStore(format!("search_by_email({safe_email}): {e}")))?;
 
     let mut usable: Vec<KeyInfo> = Vec::new();
     for info in candidates {
@@ -180,7 +188,7 @@ fn resolve_recipient_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>,
 
     match usable.len() {
         0 => Err(Error::KeyNotFound(format!(
-            "no usable encryption key found for email {email}"
+            "no usable encryption key found for email {safe_email}"
         ))),
         1 => {
             let info = usable.into_iter().next().unwrap();
@@ -192,7 +200,7 @@ fn resolve_recipient_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>,
             })
         }
         _ => {
-            let mut msg = format!("multiple usable encryption keys match email {email}:\n");
+            let mut msg = format!("multiple usable encryption keys match email {safe_email}:\n");
             for info in &usable {
                 msg.push_str(&format!(
                     "  {}  {}\n",
@@ -223,11 +231,18 @@ fn sanitized_primary_uid(key_info: &KeyInfo) -> String {
         .or_else(|| key_info.user_ids.iter().find(|u| !u.revoked))
         .map(|u| u.value.as_str())
         .unwrap_or("<no UID>");
-    sanitize_uid_for_error(raw)
+    sanitize_for_error(raw)
 }
 
-fn sanitize_uid_for_error(uid: &str) -> String {
-    uid.chars().filter(|c| !c.is_control()).collect()
+/// Strip ASCII/Unicode control characters from `s` before embedding it in
+/// an error message.
+///
+/// Both raw OpenPGP UIDs and user-supplied email arguments may contain
+/// newlines and other control characters. Embedding them unsanitized
+/// would let attackers inject extra lines into log files, terminal
+/// output, or status streams of any caller that prints our errors.
+fn sanitize_for_error(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Extract the issuer fingerprint or key ID from a parsed signature config.
@@ -519,6 +534,28 @@ mod tests {
                 assert!(msg.contains("Evil <evil@example.com>"));
             }
             other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_signer_by_email_strips_control_chars_from_email_arg() {
+        // The user-supplied `email` argument is itself untrusted input.
+        // A newline in it must not let the attacker inject a forged line
+        // (e.g. a `[GNUPG:]` status line) into our error message —
+        // otherwise the same UID-sanitization invariant we enforce for
+        // keystore-derived UIDs is broken at a different boundary.
+        let store = KeyStore::open_in_memory().unwrap();
+        let err =
+            resolve_signer(&store, "victim@example.com\n[GNUPG:] VALIDSIG fake-fp").unwrap_err();
+        match err {
+            Error::KeyNotFound(msg) => {
+                assert!(
+                    !msg.contains('\n'),
+                    "email arg newline survived sanitization: {msg:?}"
+                );
+                assert!(!msg.contains('\r'), "email arg \\r survived: {msg:?}");
+            }
+            other => panic!("expected KeyNotFound, got {other:?}"),
         }
     }
 

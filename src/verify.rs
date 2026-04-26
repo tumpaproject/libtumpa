@@ -229,9 +229,21 @@ fn issuer_key_id_for_display(issuer_ids: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// Parse a stored cert into a `SignedPublicKey` for signature verification.
+///
+/// The wecanencrypt keystore preserves whatever bytes were originally
+/// imported — `import_key(armored_string.as_bytes())` round-trips as
+/// armored, `import_key(binary_secret)` round-trips as binary. We must
+/// handle both, for both public-only and secret-bearing entries.
 fn parse_verifying_cert(cert_data: &[u8]) -> Result<SignedPublicKey> {
+    if let Ok((cert, _headers)) = SignedPublicKey::from_armor_single(Cursor::new(cert_data)) {
+        return Ok(cert);
+    }
     if let Ok((cert, _headers)) = SignedPublicKey::from_reader_single(Cursor::new(cert_data)) {
         return Ok(cert);
+    }
+    if let Ok((secret, _headers)) = SignedSecretKey::from_armor_single(Cursor::new(cert_data)) {
+        return Ok(secret.into());
     }
 
     let (secret, _headers) = SignedSecretKey::from_reader_single(Cursor::new(cert_data))
@@ -345,6 +357,23 @@ mod tests {
             }
             other => panic!("expected Good, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_inline_good_with_armored_public_only_cert() {
+        // Common path when a user runs `gpg --import` of an armored public
+        // key: wecanencrypt stores the armored bytes verbatim. `verify_inline`
+        // must therefore handle armored cert bytes (not just binary).
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(key.public_key.as_bytes()).unwrap();
+
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let outcome = verify_inline(&store, &signed).unwrap();
+        assert!(
+            matches!(outcome, VerifyOutcome::Good { .. }),
+            "verify_inline must accept armored public-only certs from the keystore: got {outcome:?}",
+        );
     }
 
     #[test]
