@@ -8,7 +8,6 @@ use wecanencrypt::{KeyInfo, KeyStore, KeyType, SubkeyInfo};
 
 use crate::error::{Error, Result};
 use crate::paths;
-use crate::verify::sanitize_uid_for_status;
 
 /// Open the tumpa keystore at the given path or fall back to
 /// [`paths::default_keystore_path`].
@@ -65,6 +64,10 @@ pub fn resolve_signer(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo)> 
         return resolve_signer_by_email(store, id);
     }
 
+    resolve_by_key_material_id(store, id)
+}
+
+fn resolve_by_key_material_id(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo)> {
     let id_upper = id.to_uppercase();
 
     if id.len() == 40 {
@@ -105,29 +108,7 @@ pub fn resolve_recipient(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo
         return resolve_recipient_by_email(store, id);
     }
 
-    let id_upper = id.to_uppercase();
-
-    if id.len() == 40 {
-        if let Ok((data, info)) = store.get_key(&id_upper) {
-            return Ok((data, info));
-        }
-    }
-
-    if id.len() == 16 {
-        if let Ok(Some(data)) = store.find_by_key_id(&id_upper) {
-            let info = wecanencrypt::parse_key_bytes(&data, true)?;
-            return Ok((data, info));
-        }
-    }
-
-    if id.len() == 40 {
-        if let Ok(Some(data)) = store.find_by_subkey_fingerprint(&id_upper) {
-            let info = wecanencrypt::parse_key_bytes(&data, true)?;
-            return Ok((data, info));
-        }
-    }
-
-    Err(Error::KeyNotFound(id.to_string()))
+    resolve_by_key_material_id(store, id)
 }
 
 /// Look up signer keys by exact email (case-insensitive), filter to those
@@ -189,30 +170,30 @@ fn resolve_recipient_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>,
         .search_by_email(email)
         .map_err(|e| Error::KeyStore(format!("search_by_email({email}): {e}")))?;
 
-    let mut usable: Vec<(Vec<u8>, KeyInfo)> = Vec::new();
+    let mut usable: Vec<KeyInfo> = Vec::new();
     for info in candidates {
         if ensure_key_usable_for_encryption(&info).is_err() {
             continue;
         }
-        match store.get_key(&info.fingerprint) {
-            Ok((data, info)) => usable.push((data, info)),
-            Err(e) => {
-                log::debug!(
-                    "resolve_recipient_by_email: get_key({}) failed after search hit: {e}",
-                    info.fingerprint
-                );
-            }
-        }
+        usable.push(info);
     }
 
     match usable.len() {
         0 => Err(Error::KeyNotFound(format!(
             "no usable encryption key found for email {email}"
         ))),
-        1 => Ok(usable.into_iter().next().unwrap()),
+        1 => {
+            let info = usable.into_iter().next().unwrap();
+            store.get_key(&info.fingerprint).map_err(|e| {
+                Error::KeyStore(format!(
+                    "resolve_recipient_by_email: get_key({}) failed after search hit: {e}",
+                    info.fingerprint
+                ))
+            })
+        }
         _ => {
             let mut msg = format!("multiple usable encryption keys match email {email}:\n");
-            for (_, info) in &usable {
+            for info in &usable {
                 msg.push_str(&format!(
                     "  {}  {}\n",
                     info.fingerprint,
@@ -242,7 +223,11 @@ fn sanitized_primary_uid(key_info: &KeyInfo) -> String {
         .or_else(|| key_info.user_ids.iter().find(|u| !u.revoked))
         .map(|u| u.value.as_str())
         .unwrap_or("<no UID>");
-    sanitize_uid_for_status(raw)
+    sanitize_uid_for_error(raw)
+}
+
+fn sanitize_uid_for_error(uid: &str) -> String {
+    uid.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Extract the issuer fingerprint or key ID from a parsed signature config.
@@ -557,5 +542,95 @@ mod tests {
         let (_, info) = resolve_recipient(&store, "alice@example.com").unwrap();
         assert!(!info.is_secret);
         ensure_key_usable_for_encryption(&info).unwrap();
+    }
+
+    #[test]
+    fn resolve_recipient_by_email_is_case_insensitive() {
+        let alice = create_key_simple(TEST_PASSWORD, &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(alice.public_key.as_bytes()).unwrap();
+
+        let (_, info) = resolve_recipient(&store, "ALICE@EXAMPLE.COM").unwrap();
+        assert!(info
+            .user_ids
+            .iter()
+            .any(|u| u.value.contains("alice@example.com")));
+    }
+
+    #[test]
+    fn resolve_recipient_by_email_ambiguous_lists_candidates() {
+        let a1 = create_key_simple(TEST_PASSWORD, &["Alice <alice@example.com>"]).unwrap();
+        let a2 = create_key_simple(TEST_PASSWORD, &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(a1.public_key.as_bytes()).unwrap();
+        store.import_key(a2.public_key.as_bytes()).unwrap();
+
+        let err = resolve_recipient(&store, "alice@example.com").unwrap_err();
+        match err {
+            Error::InvalidInput(msg) => {
+                assert!(msg.contains("multiple usable encryption keys"));
+                assert!(msg.contains("disambiguate"));
+                let info1 = parse_key_bytes(a1.public_key.as_bytes(), true).unwrap();
+                let info2 = parse_key_bytes(a2.public_key.as_bytes(), true).unwrap();
+                assert!(msg.contains(&info1.fingerprint));
+                assert!(msg.contains(&info2.fingerprint));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_recipient_by_email_skips_revoked_and_expired_keys() {
+        let revoked = create_key_simple(TEST_PASSWORD, &["Alice <alice@example.com>"]).unwrap();
+        let revoked = revoke_key(&revoked.secret_key, TEST_PASSWORD).unwrap();
+
+        let creation_time = Utc::now() - Duration::days(3);
+        let expired = create_key(
+            TEST_PASSWORD,
+            &["Alice <alice@example.com>"],
+            CipherSuite::Cv25519,
+            Some(creation_time),
+            None,
+            Some(Utc::now() - Duration::days(1)),
+            SubkeyFlags::all(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+        store.import_key(expired.public_key.as_bytes()).unwrap();
+
+        let err = resolve_recipient(&store, "alice@example.com").unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound(_)));
+    }
+
+    #[test]
+    fn resolve_recipient_by_email_skips_non_encryption_capable_keys() {
+        let signing_only = create_key(
+            TEST_PASSWORD,
+            &["Alice <alice@example.com>"],
+            CipherSuite::Cv25519,
+            None,
+            None,
+            None,
+            SubkeyFlags {
+                encryption: false,
+                signing: true,
+                authentication: false,
+            },
+            false,
+            true,
+        )
+        .unwrap();
+
+        let store = KeyStore::open_in_memory().unwrap();
+        store
+            .import_key(signing_only.public_key.as_bytes())
+            .unwrap();
+
+        let err = resolve_recipient(&store, "alice@example.com").unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound(_)));
     }
 }
