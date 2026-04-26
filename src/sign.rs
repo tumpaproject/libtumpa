@@ -32,6 +32,48 @@ pub fn sign_detached_with_key(
         .map_err(|e| Error::Sign(format!("sign_bytes_detached: {e}")))
 }
 
+/// Sign `data` with a software secret key, producing a cleartext-signed
+/// (`-----BEGIN PGP SIGNED MESSAGE-----`) message with the original text
+/// embedded.
+///
+/// Cleartext signatures are text-only by definition; binary input may
+/// roundtrip but is not the supported use case. There is no card-based
+/// equivalent today — for card-only keys use [`sign_detached`].
+pub fn sign_cleartext_with_key(
+    key_data: &[u8],
+    data: &[u8],
+    passphrase: &Passphrase,
+) -> Result<Vec<u8>> {
+    if passphrase.is_empty() {
+        return Err(Error::Sign("empty passphrase".into()));
+    }
+    wecanencrypt::sign_bytes_cleartext(key_data, data, passphrase.as_str())
+        .map_err(|e| Error::Sign(format!("sign_bytes_cleartext: {e}")))
+}
+
+/// Convert an ASCII-armored detached signature (`-----BEGIN PGP
+/// SIGNATURE-----` … `-----END PGP SIGNATURE-----`) to its binary
+/// representation by round-tripping through `pgp::DetachedSignature`.
+///
+/// Used by callers that want a `.sig` (binary) output but have an armored
+/// signature in hand because the underlying signer (software or card)
+/// only emits armored output.
+pub fn dearmor_detached_signature(armored: &[u8]) -> Result<Vec<u8>> {
+    use pgp::composed::{Deserializable, DetachedSignature};
+    use pgp::ser::Serialize;
+    use std::io::Cursor;
+
+    let (sig, _headers) = DetachedSignature::from_armor_single(Cursor::new(armored))
+        .map_err(|e| Error::Sign(format!("dearmor: failed to parse armored signature: {e}")))?;
+    let mut out = Vec::with_capacity(armored.len());
+    sig.to_writer(&mut out).map_err(|e| {
+        Error::Sign(format!(
+            "dearmor: failed to serialize binary signature: {e}"
+        ))
+    })?;
+    Ok(out)
+}
+
 #[cfg(feature = "card")]
 mod card_signing {
     use super::*;
@@ -179,6 +221,47 @@ where
     };
 
     sign_detached_inner(key_data, key_info, data, card_attempt, secret)
+}
+
+/// Sign `data` as a cleartext-signed message using a software secret key.
+///
+/// Software-only by design: there is no card-based cleartext-signing
+/// primitive in wecanencrypt today. If `key_info.is_secret` is `false`
+/// (the keystore has only a public copy) this returns
+/// [`Error::Sign`]; the caller should error out rather than silently
+/// fall through to detached signing.
+///
+/// The closure is invoked exactly once with [`SecretRequest::KeyPassphrase`].
+/// Returning [`Secret::Pin`] is rejected.
+pub fn sign_cleartext<F>(
+    key_data: &[u8],
+    key_info: &KeyInfo,
+    data: &[u8],
+    mut secret: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
+{
+    store::ensure_key_usable_for_signing(key_info)?;
+
+    if !key_info.is_secret {
+        return Err(Error::Sign(format!(
+            "inline (cleartext) signing requires a software secret key for {}; \
+             card-only keys are not supported \
+             — use detached signing instead",
+            key_info.fingerprint
+        )));
+    }
+
+    let pass = match secret(SecretRequest::KeyPassphrase { key_info })? {
+        Secret::Passphrase(p) => p,
+        Secret::Pin(_) => {
+            return Err(Error::Sign(
+                "closure returned a PIN, but a key passphrase was requested".into(),
+            ))
+        }
+    };
+    sign_cleartext_with_key(key_data, data, &pass)
 }
 
 /// Software-only [`sign_detached`] variant (no card support).
@@ -446,5 +529,79 @@ mod tests {
             .unwrap();
         assert!(sig.contains("BEGIN PGP SIGNATURE"));
         assert_eq!(backend, SignBackend::Software);
+    }
+
+    #[test]
+    fn cleartext_sign_and_verify_software() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        let signed = sign_cleartext(&key.secret_key, &info, b"hello\n", |req| match req {
+            SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+            SecretRequest::CardPin { .. } => panic!("cleartext path must never request a PIN"),
+        })
+        .unwrap();
+
+        let signed_str = std::str::from_utf8(&signed).unwrap();
+        assert!(signed_str.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
+        assert!(signed_str.contains("hello"));
+        assert!(signed_str.contains("-----BEGIN PGP SIGNATURE-----"));
+
+        let verified = wecanencrypt::verify_bytes(key.public_key.as_bytes(), &signed).unwrap();
+        assert!(verified);
+    }
+
+    #[test]
+    fn cleartext_sign_rejects_public_only_key() {
+        let key = create_key_simple("pw", &["Alice <a@e.com>"]).unwrap();
+        let info = parse_key_bytes(key.public_key.as_bytes(), true).unwrap();
+        assert!(!info.is_secret);
+
+        let err = sign_cleartext(key.public_key.as_bytes(), &info, b"hello", |_| {
+            panic!("should reject before requesting any secret")
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("inline (cleartext) signing requires a software secret key"));
+    }
+
+    #[test]
+    fn cleartext_sign_rejects_pin_secret() {
+        let key = create_key_simple("pw", &["Alice <a@e.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        let err = sign_cleartext(&key.secret_key, &info, b"hello", |_| {
+            Ok(Secret::Pin(Pin::new(b"12345678".to_vec())))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("PIN"));
+    }
+
+    #[test]
+    fn dearmor_roundtrips_to_verifiable_binary() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let armored = sign_detached_with_key(&key.secret_key, b"hello", &pw("pw")).unwrap();
+
+        let binary = dearmor_detached_signature(armored.as_bytes()).unwrap();
+        // Sanity: binary form is shorter than ASCII armor.
+        assert!(binary.len() < armored.len());
+        // First byte must be a packet header tag (high bit set per OpenPGP).
+        assert!(
+            !binary.is_empty() && (binary[0] & 0x80) != 0,
+            "got first byte: {:#x}",
+            binary[0]
+        );
+
+        // Verify the binary form is still a valid detached signature.
+        let valid =
+            wecanencrypt::verify_bytes_detached(key.public_key.as_bytes(), b"hello", &binary)
+                .unwrap();
+        assert!(valid);
+    }
+
+    #[test]
+    fn dearmor_rejects_garbage() {
+        let err = dearmor_detached_signature(b"not an armored signature").unwrap_err();
+        assert!(err.to_string().contains("dearmor"));
     }
 }
