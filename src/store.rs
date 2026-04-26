@@ -133,10 +133,10 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
         match store.get_key(&info.fingerprint) {
             Ok((data, info)) => usable.push((data, info)),
             Err(e) => {
-                log::debug!(
-                    "resolve_signer_by_email: get_key({}) failed after search hit: {e}",
+                return Err(Error::KeyStore(format!(
+                    "resolve_signer_by_email({email}): get_key({}) failed after search hit: {e}",
                     info.fingerprint
-                );
+                )));
             }
         }
     }

@@ -22,7 +22,10 @@
 
 use std::io::Cursor;
 
-use pgp::composed::{CleartextSignedMessage, Deserializable, DetachedSignature};
+use pgp::composed::{
+    CleartextSignedMessage, Deserializable, DetachedSignature, SignedPublicKey, SignedSecretKey,
+};
+use pgp::types::KeyDetails;
 use wecanencrypt::{KeyInfo, KeyStore};
 
 use crate::error::{Error, Result};
@@ -94,16 +97,7 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
 
     let lookup = store::resolve_from_issuer_ids(store, &issuer_ids)?;
     let Some((cert_data, cert_info)) = lookup else {
-        let key_id = if let Some(kid) = issuer_ids.iter().find(|id| id.len() == 16) {
-            kid.to_uppercase()
-        } else if let Some(fp) = issuer_ids.iter().find(|id| id.len() == 40) {
-            fp[24..].to_uppercase()
-        } else {
-            issuer_ids
-                .first()
-                .map(|s| s.to_uppercase())
-                .unwrap_or_default()
-        };
+        let key_id = issuer_key_id_for_display(&issuer_ids);
         return Ok(VerifyOutcome::UnknownKey { key_id });
     };
 
@@ -155,6 +149,7 @@ pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOu
             "cleartext-signed message has no signature".into(),
         ));
     }
+    let normalized_text = msg.signed_text();
 
     // Track outcomes across all embedded signatures so that, if no
     // signature verifies, we can still report the most useful failure
@@ -186,8 +181,8 @@ pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOu
             continue;
         };
 
-        let valid = wecanencrypt::verify_bytes(&cert_data, signed_message).unwrap_or(false);
-        if valid {
+        let cert = parse_verifying_cert(&cert_data)?;
+        if verify_signature_with_cert(&cert, &issuer_ids, sig, normalized_text.as_bytes()) {
             let verifier_fp = issuer_ids
                 .iter()
                 .find(|id| id.len() == 40)
@@ -232,6 +227,47 @@ fn issuer_key_id_for_display(issuer_ids: &[String]) -> String {
         .first()
         .map(|s| s.to_uppercase())
         .unwrap_or_default()
+}
+
+fn parse_verifying_cert(cert_data: &[u8]) -> Result<SignedPublicKey> {
+    if let Ok((cert, _headers)) = SignedPublicKey::from_reader_single(Cursor::new(cert_data)) {
+        return Ok(cert);
+    }
+
+    let (secret, _headers) = SignedSecretKey::from_reader_single(Cursor::new(cert_data))
+        .map_err(|e| Error::KeyStore(format!("failed to parse signer cert from keystore: {e}")))?;
+    Ok(secret.into())
+}
+
+fn verify_signature_with_cert(
+    cert: &SignedPublicKey,
+    issuer_ids: &[String],
+    sig: &pgp::packet::Signature,
+    normalized_text: &[u8],
+) -> bool {
+    if issuer_matches_key(
+        issuer_ids,
+        &hex::encode(cert.primary_key.fingerprint().as_bytes()).to_uppercase(),
+        &hex::encode(cert.primary_key.legacy_key_id()).to_uppercase(),
+    ) && sig.verify(&cert.primary_key, normalized_text).is_ok()
+    {
+        return true;
+    }
+
+    cert.public_subkeys.iter().any(|subkey| {
+        issuer_matches_key(
+            issuer_ids,
+            &hex::encode(subkey.fingerprint().as_bytes()).to_uppercase(),
+            &hex::encode(subkey.legacy_key_id()).to_uppercase(),
+        ) && sig.verify(subkey, normalized_text).is_ok()
+    })
+}
+
+fn issuer_matches_key(issuer_ids: &[String], fingerprint: &str, key_id: &str) -> bool {
+    issuer_ids.iter().any(|id| {
+        let id = id.to_uppercase();
+        id == fingerprint || id == key_id
+    })
 }
 
 #[cfg(test)]
