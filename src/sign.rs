@@ -193,6 +193,7 @@ pub struct DetachedSignResult {
 /// (the card chooses; we don't override). For software signing the
 /// caller already knows the algorithm but we round-trip through this
 /// helper anyway for symmetry.
+#[allow(dead_code)]
 fn hash_algorithm_of_armored_sig(armored: &[u8]) -> Result<HashAlgorithm> {
     use pgp::composed::{Deserializable, DetachedSignature};
     use std::io::Cursor;
