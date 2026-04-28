@@ -11,11 +11,40 @@
 //! Ported from `tumpa-cli/src/gpg/sign.rs` with the `[GNUPG:]` stderr
 //! lines stripped; tumpa-cli's `gpg/` shim keeps those for git.
 
-use wecanencrypt::KeyInfo;
+use wecanencrypt::{HashAlgorithm, KeyInfo};
 
 use crate::error::{Error, Result};
 use crate::store;
 use crate::{Passphrase, Pin};
+
+/// Parse a tumpa-cli / GnuPG-style digest-algo name into a `HashAlgorithm`.
+///
+/// Accepts SHA256, SHA384, and SHA512 (case-insensitive). Any combination
+/// of `-`, `_`, or space characters is stripped from the input before
+/// matching, so `"SHA-256"`, `"sha_512"`, and `"SHA 384"` all work.
+/// `SHA2` prefixes are also accepted (`"SHA2-256"`, `"SHA2_512"`, …)
+/// and treated as their plain `SHA<n>` equivalent.
+///
+/// SHA1 / MD5 / RIPEMD-160 are deliberately rejected — they're outside
+/// what RFC 9580 §9.5 considers acceptable for new signatures and we
+/// don't want a `--digest-algo SHA1` flag to silently downgrade email
+/// signatures.
+pub fn parse_digest_algo(s: &str) -> Result<HashAlgorithm> {
+    let normalized: String = s
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    match normalized.as_str() {
+        "SHA256" | "SHA2256" => Ok(HashAlgorithm::Sha256),
+        "SHA384" | "SHA2384" => Ok(HashAlgorithm::Sha384),
+        "SHA512" | "SHA2512" => Ok(HashAlgorithm::Sha512),
+        _ => Err(Error::InvalidInput(format!(
+            "unsupported digest algorithm '{s}'; \
+             accepted values: SHA256, SHA384, SHA512"
+        ))),
+    }
+}
 
 /// Sign `data` with a software secret key, producing an armored detached
 /// signature.
@@ -30,6 +59,23 @@ pub fn sign_detached_with_key(
     }
     wecanencrypt::sign_bytes_detached(key_data, data, passphrase.as_str())
         .map_err(|e| Error::Sign(format!("sign_bytes_detached: {e}")))
+}
+
+/// Sign `data` with a software secret key, optionally pinning the hash
+/// algorithm. Returns the armored signature plus the hash algorithm
+/// actually used — needed for callers that have to fill the
+/// `multipart/signed` `micalg` parameter (RFC 3156).
+pub fn sign_detached_with_key_and_hash(
+    key_data: &[u8],
+    data: &[u8],
+    passphrase: &Passphrase,
+    hash_algo: Option<HashAlgorithm>,
+) -> Result<wecanencrypt::DetachedSignOutput> {
+    if passphrase.is_empty() {
+        return Err(Error::Sign("empty passphrase".into()));
+    }
+    wecanencrypt::sign_bytes_detached_with_hash(key_data, data, passphrase.as_str(), hash_algo)
+        .map_err(|e| Error::Sign(format!("sign_bytes_detached_with_hash: {e}")))
 }
 
 /// Sign `data` with a software secret key, producing a cleartext-signed
@@ -108,16 +154,61 @@ mod card_signing {
         wecanencrypt::card::sign_bytes_detached_on_card(data, key_data, pin.as_slice(), ident)
             .map_err(|e| Error::Card(format!("sign_bytes_detached_on_card: {e}")))
     }
+
+    /// Sign `text` with a connected OpenPGP card, producing a cleartext-
+    /// signed (`-----BEGIN PGP SIGNED MESSAGE-----`) message.
+    ///
+    /// Counterpart to [`super::sign_cleartext_with_key`] for card-backed
+    /// keys. The card produces the signature; the wrapping armored
+    /// CleartextSignedMessage is built in software.
+    pub fn sign_cleartext_on_card(
+        key_data: &[u8],
+        data: &[u8],
+        pin: &Pin,
+        ident: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        wecanencrypt::card::sign_text_cleartext_on_card(data, key_data, pin.as_slice(), ident)
+            .map_err(|e| Error::Card(format!("sign_text_cleartext_on_card: {e}")))
+    }
 }
 
 #[cfg(feature = "card")]
-pub use card_signing::{find_signing_card, sign_detached_on_card};
+pub use card_signing::{find_signing_card, sign_cleartext_on_card, sign_detached_on_card};
 
 /// Tell a caller which signing backend was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignBackend {
     Card,
     Software,
+}
+
+/// Result of [`sign_detached_with_hash`]: signature plus the metadata a
+/// PGP/MIME `multipart/signed` builder needs (`micalg` parameter, signer
+/// backend annotation).
+#[derive(Debug, Clone)]
+pub struct DetachedSignResult {
+    pub armored: String,
+    pub backend: SignBackend,
+    pub hash_algorithm: HashAlgorithm,
+}
+
+/// Extract the hash algorithm field from an armored detached signature.
+///
+/// Used to surface the actual hash a card-backed signing produced
+/// (the card chooses; we don't override). For software signing the
+/// caller already knows the algorithm but we round-trip through this
+/// helper anyway for symmetry.
+#[allow(dead_code)]
+fn hash_algorithm_of_armored_sig(armored: &[u8]) -> Result<HashAlgorithm> {
+    use pgp::composed::{Deserializable, DetachedSignature};
+    use std::io::Cursor;
+
+    let (sig, _) = DetachedSignature::from_armor_single(Cursor::new(armored))
+        .map_err(|e| Error::Sign(format!("could not re-parse own signature: {e}")))?;
+    let cfg = sig.signature.config().ok_or_else(|| {
+        Error::Sign("signature config missing — cannot determine hash algorithm".into())
+    })?;
+    Ok(cfg.hash_alg)
 }
 
 /// A request for a secret during [`sign_detached`].
@@ -223,22 +314,200 @@ where
     sign_detached_inner(key_data, key_info, data, card_attempt, secret)
 }
 
-/// Sign `data` as a cleartext-signed message using a software secret key.
+/// Like [`sign_detached`] but accepts a `hash_preference` and reports the
+/// hash algorithm that was actually used.
 ///
-/// Software-only by design: there is no card-based cleartext-signing
-/// primitive in wecanencrypt today. If `key_info.is_secret` is `false`
-/// (the keystore has only a public copy) this returns
-/// [`Error::Sign`]; the caller should error out rather than silently
-/// fall through to detached signing.
+/// **Card path** ignores `hash_preference`: smartcards pick the digest
+/// from their slot's algorithm capabilities and we don't override. We
+/// still round-trip through the resulting signature packet to surface the
+/// actual hash via [`DetachedSignResult::hash_algorithm`] so PGP/MIME
+/// callers can fill `micalg` correctly.
 ///
-/// The closure is invoked exactly once with [`SecretRequest::KeyPassphrase`].
-/// Returning [`Secret::Pin`] is rejected.
+/// **Software path** honors `hash_preference` if `Some`; if `None`, the
+/// hash is auto-selected from the signing key's public params.
+#[cfg(feature = "card")]
+pub fn sign_detached_with_hash<F>(
+    key_data: &[u8],
+    key_info: &KeyInfo,
+    data: &[u8],
+    hash_preference: Option<HashAlgorithm>,
+    mut secret: F,
+) -> Result<DetachedSignResult>
+where
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
+{
+    store::ensure_key_usable_for_signing(key_info)?;
+
+    let card_attempt: Option<Result<String>> = match find_signing_card(key_data) {
+        Ok(Some(m)) => {
+            let card_ident = m.card.ident.clone();
+            Some(
+                secret(SecretRequest::CardPin {
+                    card_ident: &card_ident,
+                    key_info,
+                })
+                .and_then(Secret::into_pin)
+                .and_then(|pin| sign_detached_on_card(key_data, data, &pin, Some(&card_ident))),
+            )
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::info!(
+                "could not enumerate smartcards ({e}); skipping card path, using software key"
+            );
+            None
+        }
+    };
+
+    if hash_preference.is_some() && card_attempt.as_ref().is_some_and(|r| r.is_ok()) {
+        log::info!("hash preference ignored on card-backed sign; the card chose its own digest");
+    }
+
+    sign_detached_inner_with_hash(
+        key_data,
+        key_info,
+        data,
+        hash_preference,
+        card_attempt,
+        secret,
+    )
+}
+
+/// Software-only [`sign_detached_with_hash`] variant (no card support).
+#[cfg(not(feature = "card"))]
+pub fn sign_detached_with_hash<F>(
+    key_data: &[u8],
+    key_info: &KeyInfo,
+    data: &[u8],
+    hash_preference: Option<HashAlgorithm>,
+    mut secret: F,
+) -> Result<DetachedSignResult>
+where
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
+{
+    store::ensure_key_usable_for_signing(key_info)?;
+
+    if !key_info.is_secret {
+        return Err(Error::Sign(format!(
+            "no secret key available for {}",
+            key_info.fingerprint
+        )));
+    }
+    let pass = match secret(SecretRequest::KeyPassphrase { key_info })? {
+        Secret::Passphrase(p) => p,
+        Secret::Pin(_) => {
+            return Err(Error::Sign(
+                "closure returned a PIN, but a key passphrase was requested".into(),
+            ))
+        }
+    };
+    // Route through the keyed helper so the empty-passphrase guard fires
+    // here too; calling `wecanencrypt::sign_bytes_detached_with_hash`
+    // directly would let an empty passphrase reach the backend, diverging
+    // from the card build's software-fallback path.
+    let out = sign_detached_with_key_and_hash(key_data, data, &pass, hash_preference)?;
+    Ok(DetachedSignResult {
+        armored: out.armored,
+        backend: SignBackend::Software,
+        hash_algorithm: out.hash_algorithm,
+    })
+}
+
+/// Sign `data` as a cleartext-signed message, trying a connected card
+/// first and falling back to the software key.
+///
+/// Mirrors [`sign_detached`]: the caller's closure is invoked once for
+/// [`SecretRequest::CardPin`] when a matching card is connected, and once
+/// for [`SecretRequest::KeyPassphrase`] when falling back to a software
+/// key. If the key has no software secret material **and** no matching
+/// card, returns [`Error::Sign`].
+///
+/// Returns the cleartext-signed message bytes plus the backend that
+/// produced the signature.
+#[cfg(feature = "card")]
 pub fn sign_cleartext<F>(
     key_data: &[u8],
     key_info: &KeyInfo,
     data: &[u8],
     mut secret: F,
-) -> Result<Vec<u8>>
+) -> Result<(Vec<u8>, SignBackend)>
+where
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
+{
+    store::ensure_key_usable_for_signing(key_info)?;
+
+    let card_attempt: Option<Result<Vec<u8>>> = match find_signing_card(key_data) {
+        Ok(Some(m)) => {
+            let card_ident = m.card.ident.clone();
+            Some(
+                secret(SecretRequest::CardPin {
+                    card_ident: &card_ident,
+                    key_info,
+                })
+                .and_then(Secret::into_pin)
+                .and_then(|pin| sign_cleartext_on_card(key_data, data, &pin, Some(&card_ident))),
+            )
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::info!(
+                "could not enumerate smartcards ({e}); skipping card path, using software key"
+            );
+            None
+        }
+    };
+
+    let card_err: Option<Error> = match card_attempt {
+        Some(Ok(signed)) => return Ok((signed, SignBackend::Card)),
+        Some(Err(e)) => {
+            log::info!("card cleartext signing failed ({e}), falling back to software key");
+            Some(e)
+        }
+        None => None,
+    };
+
+    if !key_info.is_secret {
+        let msg = match card_err {
+            Some(e) => format!(
+                "no software secret key available for {} (card path failed: {e})",
+                key_info.fingerprint
+            ),
+            None => format!(
+                "inline (cleartext) signing requires a software secret key for {} \
+                 and no matching card was found",
+                key_info.fingerprint
+            ),
+        };
+        return Err(Error::Sign(msg));
+    }
+
+    let pass = match secret(SecretRequest::KeyPassphrase { key_info })? {
+        Secret::Passphrase(p) => p,
+        Secret::Pin(_) => {
+            return Err(Error::Sign(
+                "closure returned a PIN, but a key passphrase was requested".into(),
+            ))
+        }
+    };
+    match sign_cleartext_with_key(key_data, data, &pass) {
+        Ok(signed) => Ok((signed, SignBackend::Software)),
+        Err(sw_err) => match card_err {
+            Some(c) => Err(Error::Sign(format!(
+                "card cleartext signing failed: {c}; software fallback failed: {sw_err}"
+            ))),
+            None => Err(sw_err),
+        },
+    }
+}
+
+/// Software-only [`sign_cleartext`] variant (no card support).
+#[cfg(not(feature = "card"))]
+pub fn sign_cleartext<F>(
+    key_data: &[u8],
+    key_info: &KeyInfo,
+    data: &[u8],
+    mut secret: F,
+) -> Result<(Vec<u8>, SignBackend)>
 where
     F: FnMut(SecretRequest<'_>) -> Result<Secret>,
 {
@@ -247,7 +516,7 @@ where
     if !key_info.is_secret {
         return Err(Error::Sign(format!(
             "inline (cleartext) signing requires a software secret key for {}; \
-             card-only keys are not supported \
+             card-only keys are not supported (build without `card` feature) \
              — use detached signing instead",
             key_info.fingerprint
         )));
@@ -261,7 +530,8 @@ where
             ))
         }
     };
-    sign_cleartext_with_key(key_data, data, &pass)
+    let signed = sign_cleartext_with_key(key_data, data, &pass)?;
+    Ok((signed, SignBackend::Software))
 }
 
 /// Software-only [`sign_detached`] variant (no card support).
@@ -338,6 +608,65 @@ where
     let pass = secret(SecretRequest::KeyPassphrase { key_info })?.into_passphrase()?;
     match sign_detached_with_key(key_data, data, &pass) {
         Ok(sig) => Ok((sig, SignBackend::Software)),
+        Err(sw_err) => match card_err {
+            Some(c) => Err(Error::Sign(format!(
+                "card signing failed: {c}; software fallback failed: {sw_err}"
+            ))),
+            None => Err(sw_err),
+        },
+    }
+}
+
+/// Hash-aware variant of [`sign_detached_inner`]. Card path returns
+/// whatever hash the card chose (parsed back out of the signature
+/// packet); software path honors `hash_preference`.
+#[cfg(feature = "card")]
+#[doc(hidden)]
+pub fn sign_detached_inner_with_hash<F>(
+    key_data: &[u8],
+    key_info: &KeyInfo,
+    data: &[u8],
+    hash_preference: Option<HashAlgorithm>,
+    card_attempt: Option<Result<String>>,
+    mut secret: F,
+) -> Result<DetachedSignResult>
+where
+    F: FnMut(SecretRequest<'_>) -> Result<Secret>,
+{
+    let card_err: Option<Error> = match card_attempt {
+        Some(Ok(sig)) => {
+            let hash_algorithm = hash_algorithm_of_armored_sig(sig.as_bytes())?;
+            return Ok(DetachedSignResult {
+                armored: sig,
+                backend: SignBackend::Card,
+                hash_algorithm,
+            });
+        }
+        Some(Err(e)) => {
+            log::info!("card signing failed ({e}), falling back to software key");
+            Some(e)
+        }
+        None => None,
+    };
+
+    if !key_info.is_secret {
+        let msg = match card_err {
+            Some(e) => format!(
+                "no software secret key available for {} (card path failed: {e})",
+                key_info.fingerprint
+            ),
+            None => format!("no secret key available for {}", key_info.fingerprint),
+        };
+        return Err(Error::Sign(msg));
+    }
+
+    let pass = secret(SecretRequest::KeyPassphrase { key_info })?.into_passphrase()?;
+    match sign_detached_with_key_and_hash(key_data, data, &pass, hash_preference) {
+        Ok(out) => Ok(DetachedSignResult {
+            armored: out.armored,
+            backend: SignBackend::Software,
+            hash_algorithm: out.hash_algorithm,
+        }),
         Err(sw_err) => match card_err {
             Some(c) => Err(Error::Sign(format!(
                 "card signing failed: {c}; software fallback failed: {sw_err}"
@@ -536,11 +865,18 @@ mod tests {
         let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
         let info = parse_key_bytes(&key.secret_key, true).unwrap();
 
-        let signed = sign_cleartext(&key.secret_key, &info, b"hello\n", |req| match req {
-            SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
-            SecretRequest::CardPin { .. } => panic!("cleartext path must never request a PIN"),
-        })
-        .unwrap();
+        let (signed, backend) =
+            sign_cleartext(&key.secret_key, &info, b"hello\n", |req| match req {
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => {
+                    // No card connected on CI, so the closure is only
+                    // invoked for KeyPassphrase. Defensive panic guards
+                    // against a regression in the no-card path.
+                    panic!("cleartext path must not request a PIN when no card is present")
+                }
+            })
+            .unwrap();
+        assert_eq!(backend, SignBackend::Software);
 
         let signed_str = std::str::from_utf8(&signed).unwrap();
         assert!(signed_str.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
@@ -563,6 +899,34 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("inline (cleartext) signing requires a software secret key"));
+    }
+
+    /// PCSC unavailable / no matching card on a host that has the `card`
+    /// feature compiled in must still produce a software-backed cleartext
+    /// signature when the keystore has the secret material. Mirrors
+    /// `pcsc_error_falls_back_to_software` for the detached path.
+    #[cfg(feature = "card")]
+    #[test]
+    fn cleartext_sign_falls_back_to_software_when_no_card() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        // No card connected on CI → `find_signing_card` returns `None`
+        // and the closure is invoked once for `KeyPassphrase` only.
+        let (signed, backend) =
+            sign_cleartext(&key.secret_key, &info, b"hello\n", |req| match req {
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => {
+                    panic!("card path should be skipped when no card is connected")
+                }
+            })
+            .unwrap();
+
+        assert_eq!(backend, SignBackend::Software);
+        let signed_str = std::str::from_utf8(&signed).unwrap();
+        assert!(signed_str.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
+        let verified = wecanencrypt::verify_bytes(key.public_key.as_bytes(), &signed).unwrap();
+        assert!(verified);
     }
 
     #[test]
@@ -603,5 +967,91 @@ mod tests {
     fn dearmor_rejects_garbage() {
         let err = dearmor_detached_signature(b"not an armored signature").unwrap_err();
         assert!(err.to_string().contains("dearmor"));
+    }
+
+    #[test]
+    fn parse_digest_algo_accepts_canonical_names() {
+        assert_eq!(parse_digest_algo("SHA256").unwrap(), HashAlgorithm::Sha256);
+        assert_eq!(parse_digest_algo("sha256").unwrap(), HashAlgorithm::Sha256);
+        assert_eq!(parse_digest_algo("SHA-256").unwrap(), HashAlgorithm::Sha256);
+        assert_eq!(
+            parse_digest_algo("sha2-256").unwrap(),
+            HashAlgorithm::Sha256
+        );
+        assert_eq!(parse_digest_algo("SHA384").unwrap(), HashAlgorithm::Sha384);
+        assert_eq!(parse_digest_algo("SHA512").unwrap(), HashAlgorithm::Sha512);
+    }
+
+    #[test]
+    fn parse_digest_algo_rejects_weak_and_unknown() {
+        // Explicit reject of weak algos: GnuPG accepts them; we do not.
+        for weak in ["SHA1", "MD5", "RIPEMD160", "RIPEMD-160"] {
+            let err = parse_digest_algo(weak).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported"),
+                "should reject {weak}: got {err}"
+            );
+        }
+        // Garbage.
+        assert!(parse_digest_algo("blake3").is_err());
+        assert!(parse_digest_algo("").is_err());
+    }
+
+    #[test]
+    fn sign_detached_with_hash_default_software() {
+        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        let result =
+            sign_detached_with_hash(&key.secret_key, &info, b"hello", None, |req| match req {
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => panic!("no card"),
+            })
+            .unwrap();
+
+        assert_eq!(result.backend, SignBackend::Software);
+        assert_eq!(result.hash_algorithm, HashAlgorithm::Sha256);
+        assert!(result.armored.contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn sign_detached_with_hash_override_sha512() {
+        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let info = parse_key_bytes(&key.secret_key, true).unwrap();
+
+        let result = sign_detached_with_hash(
+            &key.secret_key,
+            &info,
+            b"hello",
+            Some(HashAlgorithm::Sha512),
+            |req| match req {
+                SecretRequest::KeyPassphrase { .. } => Ok(Secret::Passphrase(pw("pw"))),
+                SecretRequest::CardPin { .. } => panic!("no card"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.backend, SignBackend::Software);
+        assert_eq!(result.hash_algorithm, HashAlgorithm::Sha512);
+
+        // Sanity: the signature must still verify.
+        let ok = wecanencrypt::verify_bytes_detached(
+            key.public_key.as_bytes(),
+            b"hello",
+            result.armored.as_bytes(),
+        )
+        .unwrap();
+        assert!(ok);
+    }
+
+    /// Round-trip through the same hash-extraction helper used by the
+    /// card path. Guards against a future change that breaks armored
+    /// re-parsing.
+    #[test]
+    fn hash_algorithm_extraction_round_trip() {
+        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let armored = sign_detached_with_key(&key.secret_key, b"x", &pw("pw")).unwrap();
+        let alg = hash_algorithm_of_armored_sig(armored.as_bytes()).unwrap();
+        assert_eq!(alg, HashAlgorithm::Sha256);
     }
 }
