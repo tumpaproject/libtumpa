@@ -53,8 +53,10 @@ pub fn open_keystore(path: Option<&Path>) -> Result<KeyStore> {
 /// uppercase, so the input is normalized.
 ///
 /// **Email semantics:** matches every UID's email portion exactly
-/// (case-insensitive). Only secret-capable, non-revoked, signing-usable
-/// keys are considered. If multiple keys match, returns
+/// (case-insensitive). Non-revoked, non-expired, signing-capable keys
+/// are considered — including public-only certs, since tumpa is
+/// card-first and a cert whose secret lives on a connected smartcard
+/// is a valid signing candidate. If multiple keys match, returns
 /// [`Error::InvalidInput`] listing them so the caller can disambiguate
 /// with a fingerprint.
 pub fn resolve_signer(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo)> {
@@ -112,9 +114,15 @@ pub fn resolve_recipient(store: &KeyStore, id: &str) -> Result<(Vec<u8>, KeyInfo
 }
 
 /// Look up signer keys by exact email (case-insensitive), filter to those
-/// usable for signing (secret material, not revoked/expired, signing
-/// capability), and return the unique match. Errors with a list of
-/// candidates if more than one key matches.
+/// usable for signing (not revoked/expired, signing capability), and
+/// return the unique match. Errors with a list of candidates if more than
+/// one key matches.
+///
+/// Public-only entries are accepted: tumpa is card-first, so a cert
+/// whose secret lives on a connected smartcard is a valid signing
+/// candidate even when the keystore holds no secret bytes. The actual
+/// sign path (`libtumpa::sign`) tries the card first and only falls
+/// back to a software secret if `is_secret`.
 fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, KeyInfo)> {
     // `email` is untrusted user input. Sanitize before embedding it in
     // any error string: a newline in `email` would let the caller's log
@@ -127,9 +135,6 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
 
     let mut usable: Vec<(Vec<u8>, KeyInfo)> = Vec::new();
     for info in candidates {
-        if !info.is_secret {
-            continue;
-        }
         if ensure_key_usable_for_signing(&info).is_err() {
             continue;
         }
@@ -148,11 +153,11 @@ fn resolve_signer_by_email(store: &KeyStore, email: &str) -> Result<(Vec<u8>, Ke
 
     match usable.len() {
         0 => Err(Error::KeyNotFound(format!(
-            "no usable secret signing key found for email {safe_email}"
+            "no usable signing key found for email {safe_email}"
         ))),
         1 => Ok(usable.into_iter().next().unwrap()),
         _ => {
-            let mut msg = format!("multiple secret signing keys match email {safe_email}:\n");
+            let mut msg = format!("multiple signing keys match email {safe_email}:\n");
             for (_, info) in &usable {
                 msg.push_str(&format!(
                     "  {}  {}\n",
@@ -457,15 +462,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_signer_by_email_skips_public_only_keys() {
-        // Public-only copy in the store. Email lookup must NOT return it as
-        // a sign-capable hit — caller wants to sign, not just locate the cert.
+    fn resolve_signer_by_email_accepts_public_only_keys() {
+        // Public-only copy in the store. tumpa is card-first: a cert
+        // whose secret lives on a smartcard is a valid signing candidate
+        // even when the keystore holds only public material. The actual
+        // sign path tries the card first, so resolution must not reject
+        // public-only entries up front.
         let alice = create_key_simple(TEST_PASSWORD, &["Alice <alice@example.com>"]).unwrap();
         let store = KeyStore::open_in_memory().unwrap();
         store.import_key(alice.public_key.as_bytes()).unwrap();
 
-        let err = resolve_signer(&store, "alice@example.com").unwrap_err();
-        assert!(matches!(err, Error::KeyNotFound(_)));
+        let (data, info) = resolve_signer(&store, "alice@example.com").unwrap();
+        assert!(!data.is_empty());
+        assert!(!info.is_secret);
+        assert!(info
+            .user_ids
+            .iter()
+            .any(|u| u.value.contains("alice@example.com")));
     }
 
     #[test]
@@ -491,7 +504,7 @@ mod tests {
         let err = resolve_signer(&store, "alice@example.com").unwrap_err();
         match err {
             Error::InvalidInput(msg) => {
-                assert!(msg.contains("multiple secret signing keys"));
+                assert!(msg.contains("multiple signing keys"));
                 // Guidance is library-generic; the CLI layer can prepend
                 // its own flag name when re-emitting the message.
                 assert!(msg.contains("disambiguate"));
