@@ -14,39 +14,61 @@
 #![cfg(feature = "card")]
 
 use libtumpa::{
+    card::{admin::factory_reset_card, list_all_cards},
     decrypt::{self, DecryptVerifyOutcome},
     encrypt, sign, KeyStore, Passphrase, Pin,
 };
-use wecanencrypt::card::{reset_card, upload_key_to_card, verify_admin_pin, CardKeySlot};
+use wecanencrypt::card::{upload_key_to_card, CardKeySlot};
 use wecanencrypt::{create_key_simple, parse_key_bytes};
 
 const USER_PIN: &[u8] = b"123456";
 const ADMIN_PIN: &[u8] = b"12345678";
 const KEY_PASSWORD: &str = "pw";
 
-/// Reset the card to factory defaults: blocks the admin PIN with three
-/// wrong attempts and then issues `reset_card`. Mirrors the helper used
-/// in wecanencrypt's own card_tests so libtumpa's tests don't inherit
-/// state from a prior run.
-fn reset_card_to_defaults() {
-    for _ in 0..3 {
-        let _ = verify_admin_pin(b"00000000", None);
+/// Resolve the card these tests should target. Reads `TUMPA_CARD_IDENT`
+/// when set; otherwise asserts that exactly one card is attached and uses
+/// it. Each test then threads the resolved ident through every card
+/// operation so a multi-card setup can't silently send destructive ops to
+/// the wrong reader.
+fn test_card_ident() -> String {
+    if let Ok(ident) = std::env::var("TUMPA_CARD_IDENT") {
+        assert!(
+            !ident.is_empty(),
+            "TUMPA_CARD_IDENT must not be empty when set"
+        );
+        return ident;
     }
-    reset_card(None).expect("card reset failed");
+
+    let cards = list_all_cards().expect("failed to list attached cards");
+    assert_eq!(
+        cards.len(),
+        1,
+        "expected exactly one attached card; set TUMPA_CARD_IDENT to pick a specific card"
+    );
+    cards.into_iter().next().unwrap().ident
 }
 
-fn fresh_key_with_uploaded_slot(uid: &str, slot: CardKeySlot) -> (Vec<u8>, Vec<u8>) {
+/// Reset the card to factory defaults via libtumpa's guarded helper:
+/// `factory_reset_card` enforces single-card semantics when called with
+/// `None` and dynamically drains the admin-PIN retry counter rather than
+/// hard-coding a count, so tests work on cards with non-3 retry limits.
+fn reset_card_to_defaults(ident: &str) {
+    factory_reset_card(Some(ident)).expect("factory_reset_card failed");
+}
+
+fn fresh_key_with_uploaded_slot(uid: &str, slot: CardKeySlot) -> (String, Vec<u8>, Vec<u8>) {
+    let ident = test_card_ident();
     let key = create_key_simple(KEY_PASSWORD, &[uid]).expect("create_key_simple failed");
-    reset_card_to_defaults();
+    reset_card_to_defaults(&ident);
     upload_key_to_card(
         &key.secret_key,
         KEY_PASSWORD.as_bytes(),
         slot,
         ADMIN_PIN,
-        None,
+        Some(&ident),
     )
     .expect("upload_key_to_card failed");
-    (key.secret_key.to_vec(), key.public_key.into_bytes())
+    (ident, key.secret_key.to_vec(), key.public_key.into_bytes())
 }
 
 fn pw(s: &str) -> Passphrase {
@@ -60,7 +82,7 @@ fn pin(b: &[u8]) -> Pin {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn find_signing_card_finds_uploaded_key() {
-    let (secret_key, _public_key) =
+    let (_ident, secret_key, _public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
     let m = sign::find_signing_card(&secret_key)
         .expect("find_signing_card errored")
@@ -71,7 +93,7 @@ fn find_signing_card_finds_uploaded_key() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_detached_dispatches_to_card() {
-    let (secret_key, public_key) =
+    let (_ident, secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
     let info = parse_key_bytes(&secret_key, true).unwrap();
 
@@ -102,7 +124,7 @@ fn sign_detached_dispatches_to_card() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_detached_card_wrong_pin_falls_back_to_software() {
-    let (secret_key, public_key) =
+    let (_ident, secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
     let info = parse_key_bytes(&secret_key, true).unwrap();
 
@@ -132,7 +154,7 @@ fn sign_detached_card_wrong_pin_falls_back_to_software() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_detached_with_hash_card_reports_hash() {
-    let (secret_key, public_key) =
+    let (_ident, secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
     let info = parse_key_bytes(&secret_key, true).unwrap();
 
@@ -166,7 +188,7 @@ fn sign_detached_with_hash_card_reports_hash() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_cleartext_dispatches_to_card() {
-    let (secret_key, public_key) =
+    let (_ident, secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
     let info = parse_key_bytes(&secret_key, true).unwrap();
 
@@ -188,9 +210,9 @@ fn sign_cleartext_dispatches_to_card() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_detached_on_card_low_level() {
-    let (_secret_key, public_key) =
+    let (ident, _secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
-    let sig = sign::sign_detached_on_card(&public_key, b"low-level", &pin(USER_PIN), None)
+    let sig = sign::sign_detached_on_card(&public_key, b"low-level", &pin(USER_PIN), Some(&ident))
         .expect("sign_detached_on_card failed");
     let ok =
         wecanencrypt::verify_bytes_detached(&public_key, b"low-level", sig.as_bytes()).unwrap();
@@ -200,10 +222,11 @@ fn sign_detached_on_card_low_level() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn sign_cleartext_on_card_low_level() {
-    let (_secret_key, public_key) =
+    let (ident, _secret_key, public_key) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
-    let signed = sign::sign_cleartext_on_card(&public_key, b"hello\n", &pin(USER_PIN), None)
-        .expect("sign_cleartext_on_card failed");
+    let signed =
+        sign::sign_cleartext_on_card(&public_key, b"hello\n", &pin(USER_PIN), Some(&ident))
+            .expect("sign_cleartext_on_card failed");
     let ok = wecanencrypt::verify_bytes(&public_key, &signed).unwrap();
     assert!(ok);
 }
@@ -211,7 +234,7 @@ fn sign_cleartext_on_card_low_level() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn find_decryption_card_finds_uploaded_key() {
-    let (_secret_key, public_key) =
+    let (_ident, _secret_key, public_key) =
         fresh_key_with_uploaded_slot("Bob <bob@example.com>", CardKeySlot::Decryption);
     // `find_decryption_card` resolves matched fingerprints through the
     // store (`find_by_subkey_fingerprint`), so the public cert needs to
@@ -229,10 +252,10 @@ fn find_decryption_card_finds_uploaded_key() {
 #[test]
 #[ignore = "requires a connected OpenPGP card (or jcecard emulator)"]
 fn decrypt_on_card_low_level() {
-    let (_secret_key, public_key) =
+    let (ident, _secret_key, public_key) =
         fresh_key_with_uploaded_slot("Bob <bob@example.com>", CardKeySlot::Decryption);
     let ct = wecanencrypt::encrypt_bytes(&public_key, b"top-secret", true).unwrap();
-    let pt = decrypt::decrypt_on_card(&public_key, &ct, &pin(USER_PIN), None)
+    let pt = decrypt::decrypt_on_card(&public_key, &ct, &pin(USER_PIN), Some(&ident))
         .expect("decrypt_on_card failed");
     assert_eq!(pt.as_slice(), b"top-secret");
 }
@@ -242,7 +265,7 @@ fn decrypt_on_card_low_level() {
 fn decrypt_and_verify_on_card_good() {
     // Alice signs in software; Bob's encryption subkey lives on the card.
     let alice = create_key_simple("alice-pw", &["Alice <a@example.com>"]).unwrap();
-    let (_bob_secret, bob_public) =
+    let (ident, _bob_secret, bob_public) =
         fresh_key_with_uploaded_slot("Bob <b@example.com>", CardKeySlot::Decryption);
 
     let store = KeyStore::open_in_memory().unwrap();
@@ -259,7 +282,7 @@ fn decrypt_and_verify_on_card_good() {
     .unwrap();
 
     let result =
-        decrypt::decrypt_and_verify_on_card(&store, &bob_public, &ct, &pin(USER_PIN), None)
+        decrypt::decrypt_and_verify_on_card(&store, &bob_public, &ct, &pin(USER_PIN), Some(&ident))
             .expect("decrypt_and_verify_on_card failed");
     assert_eq!(result.plaintext.as_slice(), b"signed and sealed");
     match result.outcome {
@@ -278,7 +301,7 @@ fn decrypt_and_verify_on_card_good() {
 fn sign_and_encrypt_on_card_to_recipients_roundtrip() {
     // Alice signs on the card; Bob receives in software.
     let bob = create_key_simple("bob-pw", &["Bob <b@example.com>"]).unwrap();
-    let (_alice_secret, alice_public) =
+    let (ident, _alice_secret, alice_public) =
         fresh_key_with_uploaded_slot("Alice <alice@example.com>", CardKeySlot::Signing);
 
     let store = KeyStore::open_in_memory().unwrap();
@@ -289,7 +312,7 @@ fn sign_and_encrypt_on_card_to_recipients_roundtrip() {
         &store,
         &alice_public,
         &pin(USER_PIN),
-        None,
+        Some(&ident),
         &["b@example.com"],
         b"hello, signed by card",
         true,

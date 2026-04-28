@@ -123,7 +123,14 @@ pub fn decrypt_and_verify_with_key(
                     resolved_signer = Some(key_info);
                     Some(cert_bytes)
                 }
-                _ => None,
+                Ok(None) => None,
+                Err(e) => {
+                    // Keystore failure (DB/IO) on signer lookup. Log so
+                    // it isn't silently flattened into UnknownKey; we
+                    // still hand back the decrypted plaintext.
+                    log::warn!("signer lookup failed for {issuer_ids:?}: {e}");
+                    None
+                }
             }
         })
         .map_err(|e| Error::Decrypt(format!("decrypt_and_verify: {e}")))?;
@@ -131,8 +138,12 @@ pub fn decrypt_and_verify_with_key(
     let outcome = match result.signature {
         DecryptVerifySignature::Unsigned => DecryptVerifyOutcome::Unsigned,
         DecryptVerifySignature::Good {
-            verifier_fingerprint,
+            mut verifier_fingerprint,
         } => {
+            // Defensive: doc contract says uppercase hex. wecanencrypt
+            // already uppercases, but the boundary normalization makes
+            // the libtumpa contract self-enforced.
+            verifier_fingerprint.make_ascii_uppercase();
             // Wecanencrypt only invokes the resolver when there's a
             // signature to verify, so on Good we always have a KeyInfo.
             // If somehow we don't, fall through to UnknownKey rather than
@@ -153,7 +164,10 @@ pub fn decrypt_and_verify_with_key(
                 issuer_ids: Vec::new(),
             },
         },
-        DecryptVerifySignature::UnknownKey { issuer_ids } => {
+        DecryptVerifySignature::UnknownKey { mut issuer_ids } => {
+            for id in &mut issuer_ids {
+                id.make_ascii_uppercase();
+            }
             DecryptVerifyOutcome::UnknownKey { issuer_ids }
         }
     };
@@ -263,7 +277,14 @@ mod card_decryption {
                     resolved_signer = Some(key_info);
                     Some(cert_bytes)
                 }
-                _ => None,
+                Ok(None) => None,
+                Err(e) => {
+                    // Keystore failure on signer lookup. Mirror the
+                    // software path: log and continue rather than
+                    // silently downgrading to UnknownKey.
+                    log::warn!("signer lookup failed for {issuer_ids:?}: {e}");
+                    None
+                }
             },
         )
         .map_err(|e| Error::Card(format!("decrypt_and_verify_on_card: {e}")))?;
@@ -271,23 +292,32 @@ mod card_decryption {
         let outcome = match result.signature {
             wecanencrypt::DecryptVerifySignature::Unsigned => super::DecryptVerifyOutcome::Unsigned,
             wecanencrypt::DecryptVerifySignature::Good {
-                verifier_fingerprint,
-            } => match resolved_signer {
-                Some(key_info) => super::DecryptVerifyOutcome::Good {
-                    key_info,
-                    verifier_fingerprint,
-                },
-                None => super::DecryptVerifyOutcome::UnknownKey {
-                    issuer_ids: vec![verifier_fingerprint],
-                },
-            },
+                mut verifier_fingerprint,
+            } => {
+                // Defensive uppercase to match the API contract; wecanencrypt
+                // already does this but a normalize-at-the-boundary keeps
+                // the libtumpa guarantee self-enforced.
+                verifier_fingerprint.make_ascii_uppercase();
+                match resolved_signer {
+                    Some(key_info) => super::DecryptVerifyOutcome::Good {
+                        key_info,
+                        verifier_fingerprint,
+                    },
+                    None => super::DecryptVerifyOutcome::UnknownKey {
+                        issuer_ids: vec![verifier_fingerprint],
+                    },
+                }
+            }
             wecanencrypt::DecryptVerifySignature::Bad => match resolved_signer {
                 Some(key_info) => super::DecryptVerifyOutcome::Bad { key_info },
                 None => super::DecryptVerifyOutcome::UnknownKey {
                     issuer_ids: Vec::new(),
                 },
             },
-            wecanencrypt::DecryptVerifySignature::UnknownKey { issuer_ids } => {
+            wecanencrypt::DecryptVerifySignature::UnknownKey { mut issuer_ids } => {
+                for id in &mut issuer_ids {
+                    id.make_ascii_uppercase();
+                }
                 super::DecryptVerifyOutcome::UnknownKey { issuer_ids }
             }
         };

@@ -260,13 +260,23 @@ pub fn extract_issuer_ids(sig: &pgp::packet::SignatureConfig) -> Vec<String> {
 }
 
 /// Look up a key in the keystore by issuer info extracted from a signature.
+///
+/// Iterates `issuer_ids` and returns the first match. A `KeyNotFound` for
+/// any individual id is treated as "not in this store, try the next" and
+/// resolves to `Ok(None)` when no id hits. Any other error (DB/IO,
+/// corrupt stored cert, …) propagates immediately so callers can
+/// distinguish "signer unknown" from "keystore lookup failed" — the
+/// software/card decrypt-and-verify paths rely on this distinction to
+/// avoid silently flattening keystore failures into `UnknownKey`.
 pub fn resolve_from_issuer_ids(
     store: &KeyStore,
     issuer_ids: &[String],
 ) -> Result<Option<(Vec<u8>, KeyInfo)>> {
     for id in issuer_ids {
-        if let Ok(result) = resolve_signer(store, id) {
-            return Ok(Some(result));
+        match resolve_signer(store, id) {
+            Ok(result) => return Ok(Some(result)),
+            Err(Error::KeyNotFound(_)) => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(None)

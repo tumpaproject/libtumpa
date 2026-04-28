@@ -19,7 +19,12 @@ use crate::{Passphrase, Pin};
 
 /// Parse a tumpa-cli / GnuPG-style digest-algo name into a `HashAlgorithm`.
 ///
-/// Accepts SHA256/SHA384/SHA512 (case-insensitive, optional `-` separator).
+/// Accepts SHA256, SHA384, and SHA512 (case-insensitive). Any combination
+/// of `-`, `_`, or space characters is stripped from the input before
+/// matching, so `"SHA-256"`, `"sha_512"`, and `"SHA 384"` all work.
+/// `SHA2` prefixes are also accepted (`"SHA2-256"`, `"SHA2_512"`, …)
+/// and treated as their plain `SHA<n>` equivalent.
+///
 /// SHA1 / MD5 / RIPEMD-160 are deliberately rejected — they're outside
 /// what RFC 9580 §9.5 considers acceptable for new signatures and we
 /// don't want a `--digest-algo SHA1` flag to silently downgrade email
@@ -396,9 +401,11 @@ where
             ))
         }
     };
-    let out =
-        wecanencrypt::sign_bytes_detached_with_hash(key_data, data, pass.as_str(), hash_preference)
-            .map_err(|e| Error::Sign(format!("sign_bytes_detached_with_hash: {e}")))?;
+    // Route through the keyed helper so the empty-passphrase guard fires
+    // here too; calling `wecanencrypt::sign_bytes_detached_with_hash`
+    // directly would let an empty passphrase reach the backend, diverging
+    // from the card build's software-fallback path.
+    let out = sign_detached_with_key_and_hash(key_data, data, &pass, hash_preference)?;
     Ok(DetachedSignResult {
         armored: out.armored,
         backend: SignBackend::Software,
