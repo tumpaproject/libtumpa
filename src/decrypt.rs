@@ -86,7 +86,10 @@ pub struct DecryptVerifyResult {
 impl std::fmt::Debug for DecryptVerifyResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecryptVerifyResult")
-            .field("plaintext", &format!("<{} bytes redacted>", self.plaintext.len()))
+            .field(
+                "plaintext",
+                &format!("<{} bytes redacted>", self.plaintext.len()),
+            )
             .field("outcome", &self.outcome)
             .finish()
     }
@@ -113,19 +116,17 @@ pub fn decrypt_and_verify_with_key(
     // into a mutable local via `&mut` over the closure.
     let mut resolved_signer: Option<KeyInfo> = None;
 
-    let result = wecanencrypt::decrypt_and_verify(
-        key_data,
-        ciphertext,
-        passphrase.as_str(),
-        |issuer_ids| match store::resolve_from_issuer_ids(store, issuer_ids) {
-            Ok(Some((cert_bytes, key_info))) => {
-                resolved_signer = Some(key_info);
-                Some(cert_bytes)
+    let result =
+        wecanencrypt::decrypt_and_verify(key_data, ciphertext, passphrase.as_str(), |issuer_ids| {
+            match store::resolve_from_issuer_ids(store, issuer_ids) {
+                Ok(Some((cert_bytes, key_info))) => {
+                    resolved_signer = Some(key_info);
+                    Some(cert_bytes)
+                }
+                _ => None,
             }
-            _ => None,
-        },
-    )
-    .map_err(|e| Error::Decrypt(format!("decrypt_and_verify: {e}")))?;
+        })
+        .map_err(|e| Error::Decrypt(format!("decrypt_and_verify: {e}")))?;
 
     let outcome = match result.signature {
         DecryptVerifySignature::Unsigned => DecryptVerifyOutcome::Unsigned,
@@ -233,17 +234,80 @@ mod card_decryption {
                 .map_err(|e| Error::Card(format!("decrypt_bytes_on_card: {e}")))?;
         Ok(Zeroizing::new(plaintext))
     }
+
+    /// Decrypt `ciphertext` on a connected card and, if the inner payload was
+    /// sign-then-encrypted, look up the signer in `store` and verify the
+    /// inner signature.
+    ///
+    /// Card-backed counterpart to [`super::decrypt_and_verify_with_key`]. The
+    /// session key is decrypted on the card; everything else (compression,
+    /// inner signature classification, signer resolution) runs in software.
+    /// The returned [`super::DecryptVerifyResult`] is shape-compatible with the
+    /// software path so callers can share rendering / status code.
+    pub fn decrypt_and_verify_on_card(
+        store: &KeyStore,
+        key_data: &[u8],
+        ciphertext: &[u8],
+        pin: &Pin,
+        ident: Option<&str>,
+    ) -> Result<super::DecryptVerifyResult> {
+        let mut resolved_signer: Option<KeyInfo> = None;
+
+        let result = wecanencrypt::card::decrypt_and_verify_on_card(
+            ciphertext,
+            key_data,
+            pin.as_slice(),
+            ident,
+            |issuer_ids| match super::store::resolve_from_issuer_ids(store, issuer_ids) {
+                Ok(Some((cert_bytes, key_info))) => {
+                    resolved_signer = Some(key_info);
+                    Some(cert_bytes)
+                }
+                _ => None,
+            },
+        )
+        .map_err(|e| Error::Card(format!("decrypt_and_verify_on_card: {e}")))?;
+
+        let outcome = match result.signature {
+            wecanencrypt::DecryptVerifySignature::Unsigned => super::DecryptVerifyOutcome::Unsigned,
+            wecanencrypt::DecryptVerifySignature::Good {
+                verifier_fingerprint,
+            } => match resolved_signer {
+                Some(key_info) => super::DecryptVerifyOutcome::Good {
+                    key_info,
+                    verifier_fingerprint,
+                },
+                None => super::DecryptVerifyOutcome::UnknownKey {
+                    issuer_ids: vec![verifier_fingerprint],
+                },
+            },
+            wecanencrypt::DecryptVerifySignature::Bad => match resolved_signer {
+                Some(key_info) => super::DecryptVerifyOutcome::Bad { key_info },
+                None => super::DecryptVerifyOutcome::UnknownKey {
+                    issuer_ids: Vec::new(),
+                },
+            },
+            wecanencrypt::DecryptVerifySignature::UnknownKey { issuer_ids } => {
+                super::DecryptVerifyOutcome::UnknownKey { issuer_ids }
+            }
+        };
+
+        Ok(super::DecryptVerifyResult {
+            plaintext: Zeroizing::new(result.plaintext),
+            outcome,
+        })
+    }
 }
 
 #[cfg(feature = "card")]
-pub use card_decryption::{decrypt_on_card, find_decryption_card, DecryptionCard};
+pub use card_decryption::{
+    decrypt_and_verify_on_card, decrypt_on_card, find_decryption_card, DecryptionCard,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wecanencrypt::{
-        create_key_simple, encrypt_bytes, sign_and_encrypt_to_multiple, KeyStore,
-    };
+    use wecanencrypt::{create_key_simple, encrypt_bytes, sign_and_encrypt_to_multiple, KeyStore};
 
     fn pw(s: &str) -> Passphrase {
         Passphrase::new(s.to_string())
@@ -337,8 +401,8 @@ mod tests {
         store.import_key(&alice.secret_key).unwrap();
         let ct = encrypt_bytes(alice.public_key.as_bytes(), b"hello", true).unwrap();
 
-        let err = decrypt_and_verify_with_key(&store, &alice.secret_key, &ct, &pw("wrong"))
-            .unwrap_err();
+        let err =
+            decrypt_and_verify_with_key(&store, &alice.secret_key, &ct, &pw("wrong")).unwrap_err();
         assert!(err.to_string().contains("decrypt"));
     }
 
