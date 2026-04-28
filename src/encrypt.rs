@@ -5,6 +5,19 @@ use wecanencrypt::KeyStore;
 use crate::error::{Error, Result};
 use crate::store;
 
+/// Resolve recipient IDs to their public-key bytes, validating each with
+/// [`store::ensure_key_usable_for_encryption`]. Shared by the software and
+/// card sign+encrypt entry points so the validation rules stay in one place.
+fn resolve_recipient_keys(store: &KeyStore, recipients: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let mut key_data_list: Vec<Vec<u8>> = Vec::with_capacity(recipients.len());
+    for id in recipients {
+        let (data, info) = store::resolve_recipient(store, id)?;
+        store::ensure_key_usable_for_encryption(&info)?;
+        key_data_list.push(data);
+    }
+    Ok(key_data_list)
+}
+
 /// Encrypt `plaintext` to one or more recipients, resolving each via the
 /// keystore. Recipient IDs may be fingerprints, key IDs, subkey
 /// fingerprints, or exact email addresses (the same IDs accepted by
@@ -18,12 +31,7 @@ pub fn encrypt_to_recipients(
     plaintext: &[u8],
     armor: bool,
 ) -> Result<Vec<u8>> {
-    let mut key_data_list: Vec<Vec<u8>> = Vec::new();
-    for id in recipients {
-        let (data, info) = store::resolve_recipient(store, id)?;
-        store::ensure_key_usable_for_encryption(&info)?;
-        key_data_list.push(data);
-    }
+    let key_data_list = resolve_recipient_keys(store, recipients)?;
     let key_refs: Vec<&[u8]> = key_data_list.iter().map(|d| d.as_slice()).collect();
 
     wecanencrypt::encrypt_bytes_to_multiple(&key_refs, plaintext, armor)
@@ -45,12 +53,7 @@ pub fn sign_and_encrypt_to_recipients(
     plaintext: &[u8],
     armor: bool,
 ) -> Result<Vec<u8>> {
-    let mut key_data_list: Vec<Vec<u8>> = Vec::new();
-    for id in recipients {
-        let (data, info) = store::resolve_recipient(store, id)?;
-        store::ensure_key_usable_for_encryption(&info)?;
-        key_data_list.push(data);
-    }
+    let key_data_list = resolve_recipient_keys(store, recipients)?;
     let key_refs: Vec<&[u8]> = key_data_list.iter().map(|d| d.as_slice()).collect();
 
     wecanencrypt::sign_and_encrypt_to_multiple(
@@ -67,23 +70,13 @@ pub fn sign_and_encrypt_to_recipients(
 mod card_encryption {
     use super::*;
     use crate::Pin;
-    use wecanencrypt::card::{find_cards_for_key, CardKeyMatch, KeySlot};
+    use wecanencrypt::card::CardKeyMatch;
 
     /// Find a connected card whose signing slot matches `signer_public_key`.
-    /// Mirrors [`crate::sign::find_signing_card`] — picks the first card with
-    /// a signing-capable slot bound to this key.
+    /// Reuses [`crate::sign::find_signing_card`] so card selection behavior
+    /// stays consistent with the signing path.
     pub fn find_signing_card_for_encrypt(signer_public_key: &[u8]) -> Result<Option<CardKeyMatch>> {
-        let matches =
-            find_cards_for_key(signer_public_key).map_err(|e| Error::Card(e.to_string()))?;
-        for m in matches {
-            if m.matching_slots
-                .iter()
-                .any(|s| matches!(s.slot, KeySlot::Signature))
-            {
-                return Ok(Some(m));
-            }
-        }
-        Ok(None)
+        crate::sign::find_signing_card(signer_public_key)
     }
 
     /// Sign with a key on the card and encrypt to one or more recipients.
@@ -100,12 +93,7 @@ mod card_encryption {
         plaintext: &[u8],
         armor: bool,
     ) -> Result<Vec<u8>> {
-        let mut key_data_list: Vec<Vec<u8>> = Vec::new();
-        for id in recipients {
-            let (data, info) = store::resolve_recipient(store, id)?;
-            store::ensure_key_usable_for_encryption(&info)?;
-            key_data_list.push(data);
-        }
+        let key_data_list = resolve_recipient_keys(store, recipients)?;
         let key_refs: Vec<&[u8]> = key_data_list.iter().map(|d| d.as_slice()).collect();
 
         wecanencrypt::card::sign_and_encrypt_to_multiple_on_card(

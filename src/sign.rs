@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::store;
 use crate::{Passphrase, Pin};
 
-/// Parse a tclig / GnuPG-style digest-algo name into a `HashAlgorithm`.
+/// Parse a tumpa-cli / GnuPG-style digest-algo name into a `HashAlgorithm`.
 ///
 /// Accepts SHA256/SHA384/SHA512 (case-insensitive, optional `-` separator).
 /// SHA1 / MD5 / RIPEMD-160 are deliberately rejected — they're outside
