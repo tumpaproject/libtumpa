@@ -5,6 +5,8 @@
 //! `card_links.json` code never shipped, so new builds simply resync.
 
 #[cfg(feature = "card")]
+use std::collections::hash_map::Entry;
+#[cfg(feature = "card")]
 use std::collections::HashMap;
 
 #[cfg(feature = "card")]
@@ -65,6 +67,18 @@ pub fn slot_tag(slot: &str) -> &'static str {
     }
 }
 
+/// Sort slot strings into the order `render_card_links_for_key`
+/// emits them: by [`slot_rank`] first, then lexicographically.
+///
+/// The lexicographic tie-break only matters when two or more slot
+/// strings share rank 99 (any future / unknown slot kind written by
+/// a newer wecanencrypt). Without it, those rows would render in
+/// HashMap-insertion order and produce nondeterministic output --
+/// breaks reproducible-output tests and confuses `diff` consumers.
+fn sort_slots_canonically(slots: &mut [String]) {
+    slots.sort_by(|a, b| slot_rank(a).cmp(&slot_rank(b)).then_with(|| a.cmp(b)));
+}
+
 /// Render the "Cards holding this key" footer that `tcli describe`
 /// appends after the subkey table.
 ///
@@ -106,7 +120,7 @@ pub fn render_card_links_for_key(assocs: &[StoredCardKey]) -> Vec<String> {
     let mut out = Vec::with_capacity(by_card.len() + 1);
     out.push("     Cards:".to_string());
     for (ident, (mfg, serial, mut slots)) in by_card {
-        slots.sort_by_key(|s| slot_rank(s));
+        sort_slots_canonically(&mut slots);
         let tags = slots
             .iter()
             .map(|s| slot_tag(s))
@@ -319,12 +333,20 @@ pub fn auto_detect(store: &KeyStore) -> Result<Vec<CardKeyDetection>> {
 pub fn apply_detections(store: &KeyStore, detections: &[CardKeyDetection]) -> Result<()> {
     let mut info_cache: HashMap<String, CardInfo> = HashMap::new();
     for d in detections {
-        if !info_cache.contains_key(&d.card_ident) {
-            let info = get_card_details(Some(&d.card_ident))
-                .map_err(|e| Error::Card(format!("get_card_details({}): {e}", d.card_ident)))?;
-            info_cache.insert(d.card_ident.clone(), info);
-        }
-        let info = &info_cache[&d.card_ident];
+        // Single hash lookup per iteration via the Entry API. The
+        // straight `or_insert(...)` form would eagerly evaluate
+        // `get_card_details(...)` even on cache hits, hammering PCSC
+        // once per detection -- defeats the whole point of the cache.
+        // The match keeps the call lazy and lets `?` propagate the
+        // error.
+        let info = match info_cache.entry(d.card_ident.clone()) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => {
+                let info = get_card_details(Some(&d.card_ident))
+                    .map_err(|e| Error::Card(format!("get_card_details({}): {e}", d.card_ident)))?;
+                v.insert(info)
+            }
+        };
         link(
             store,
             &d.key_fingerprint,
@@ -416,6 +438,34 @@ mod tests {
         // crashing — defensive for forward-compat with new slot
         // strings the keystore might persist.
         assert_eq!(slot_tag("attestation"), "?");
+    }
+
+    /// Two unknown slot strings share rank 99, so sort_by_key alone
+    /// would leave their relative order up to the underlying sort's
+    /// stability (which `sort_by_key` does NOT guarantee). The
+    /// secondary lexicographic tie-break makes render output
+    /// deterministic across runs.
+    #[test]
+    fn sort_slots_canonically_uses_lexicographic_tiebreaker_for_unknowns() {
+        let mut xs = vec![
+            "zeta".to_string(),
+            "alpha".to_string(),
+            "encryption".to_string(),
+            "signature".to_string(),
+            "mu".to_string(),
+        ];
+        sort_slots_canonically(&mut xs);
+        assert_eq!(
+            xs,
+            vec![
+                "signature".to_string(),  // rank 0
+                "encryption".to_string(), // rank 1
+                // three unknowns at rank 99 sorted alphabetically:
+                "alpha".to_string(),
+                "mu".to_string(),
+                "zeta".to_string(),
+            ]
+        );
     }
 
     // ---- render_card_links_for_key ----
