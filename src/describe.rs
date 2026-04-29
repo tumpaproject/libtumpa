@@ -110,7 +110,10 @@ pub fn format_key_info(key_data: &[u8], key_info: &KeyInfo) -> String {
                 sk.creation_time.format(TIME_FMT)
             ));
             if let Some(t) = sk.expiration_time {
-                out.push_str(&format!("                 Expires:  {}\n", t.format(TIME_FMT)));
+                out.push_str(&format!(
+                    "                 Expires:  {}\n",
+                    t.format(TIME_FMT)
+                ));
             }
         }
     }
@@ -122,12 +125,24 @@ pub fn format_key_info(key_data: &[u8], key_info: &KeyInfo) -> String {
 /// [`crate::card::link::render_card_links_for_key`] to `body`.
 ///
 /// No-op when `assocs` is empty (no linked cards → no footer).
+///
+/// Gated on the card features because `crate::card` only compiles
+/// when `feature = "card"` or `feature = "card-mobile"` is enabled.
+/// A `#[cfg(not(...))]` no-op shim with the same signature is
+/// provided so callers don't need their own cfg chain — the only
+/// way to obtain a non-empty `assocs` slice without the card
+/// features is to construct one by hand, in which case the no-op
+/// shim simply emits no Cards footer.
+#[cfg(any(feature = "card", feature = "card-mobile"))]
 pub fn append_card_links(body: &mut String, assocs: &[StoredCardKey]) {
     for line in crate::card::link::render_card_links_for_key(assocs) {
         body.push_str(&line);
         body.push('\n');
     }
 }
+
+#[cfg(not(any(feature = "card", feature = "card-mobile")))]
+pub fn append_card_links(_body: &mut String, _assocs: &[StoredCardKey]) {}
 
 fn format_algo(algorithm: &str, bit_length: usize) -> String {
     if bit_length > 0 {
@@ -140,7 +155,9 @@ fn format_algo(algorithm: &str, bit_length: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wecanencrypt::{create_key_simple, parse_key_bytes, KeyStore};
+    #[cfg(any(feature = "card", feature = "card-mobile"))]
+    use wecanencrypt::KeyStore;
+    use wecanencrypt::{create_key_simple, parse_key_bytes};
 
     fn alice() -> (Vec<u8>, KeyInfo) {
         let gen = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
@@ -212,6 +229,7 @@ mod tests {
         assert_eq!(s, before);
     }
 
+    #[cfg(any(feature = "card", feature = "card-mobile"))]
     #[test]
     fn append_card_links_appends_renderer_output() {
         let (bytes, info) = alice();
@@ -234,6 +252,7 @@ mod tests {
         assert!(s.contains("[S]"));
     }
 
+    #[cfg(any(feature = "card", feature = "card-mobile"))]
     #[test]
     fn end_to_end_through_keystore_links_card() {
         // Round-trip: import a generated cert into a keystore, link a
@@ -260,7 +279,10 @@ mod tests {
         let mut s = format_key_info(&bytes, &info);
         append_card_links(&mut s, &assocs);
 
-        assert!(s.starts_with("sec  "), "secret key in keystore → 'sec' header");
+        assert!(
+            s.starts_with("sec  "),
+            "secret key in keystore → 'sec' header"
+        );
         assert!(s.contains("Bob <bob@example.com>"));
         assert!(s.contains("Cards:"));
         assert!(s.contains("000F:CB9A5355"));
