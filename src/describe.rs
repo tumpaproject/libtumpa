@@ -9,16 +9,16 @@
 //!
 //! ```text
 //! pub  37417ABF...0537  Ed25519  [sign, certify]
-//!      Created:  2024-09-12 09:00:00 UTC
-//!      Expires:  never
+//!     Created:  2024-09-12 09:00:00 UTC
+//!     Expires:  never
 //!      UIDs:
-//!        [primary] Kushal Das <kushal@civilized.systems>
-//!      Subkeys:
-//!        AAAA...  Ed25519  [signing]
-//!                 Created:  ...
-//!                 Expires:  ...
-//!      Cards:
-//!        000F:CB9A5355  Nitrokey GmbH (CB9A5355)  [S E A]
+//!       [primary] Kushal Das <kushal@c.s>
+//!     Subkeys:
+//!       AAAA...  Ed25519  [signing]
+//!                Created:  ...
+//!                Expires:  ...
+//!     Cards:
+//!       000F:CB9A5355  Nitrokey GmbH (CB9A5355)  [S E A]
 //! ```
 //!
 //! The `Cards:` block is appended only when the keystore has linked
@@ -109,11 +109,18 @@ pub fn format_key_info(key_data: &[u8], key_info: &KeyInfo) -> String {
                 "                 Created:  {}\n",
                 sk.creation_time.format(TIME_FMT)
             ));
+            // Mirror the primary key's behavior: never-expiring
+            // subkeys still get an "Expires: never" line so the per-
+            // subkey block has the same shape regardless of expiry,
+            // matches the module-doc rendering, and gives the per-
+            // subkey expiry count parity with `Created:`.
             if let Some(t) = sk.expiration_time {
                 out.push_str(&format!(
                     "                 Expires:  {}\n",
                     t.format(TIME_FMT)
                 ));
+            } else {
+                out.push_str("                 Expires:  never\n");
             }
         }
     }
@@ -218,6 +225,28 @@ mod tests {
         let (bytes, info) = alice();
         let out = format_key_info(&bytes, &info);
         assert!(out.contains("Expires:  never"));
+    }
+
+    /// Pins PR #15 review comment: never-expiring subkeys must emit
+    /// `Expires:  never` rather than dropping the line entirely, so
+    /// every subkey block has Created+Expires symmetric with the
+    /// primary's block, and the module-doc rendering is honest.
+    #[test]
+    fn subkey_with_no_expiration_renders_expires_never() {
+        let (bytes, info) = alice();
+        let out = format_key_info(&bytes, &info);
+        // One Expires line per subkey + one for the primary.
+        let expires_count = out.matches("Expires:").count();
+        assert_eq!(expires_count, 1 + info.subkeys.len(), "got:\n{out}");
+        // And every never-expiring subkey contributes a "never" line.
+        let never_count = out.matches("Expires:  never").count();
+        let never_expected = 1 // primary
+            + info
+                .subkeys
+                .iter()
+                .filter(|sk| sk.expiration_time.is_none())
+                .count();
+        assert_eq!(never_count, never_expected, "got:\n{out}");
     }
 
     #[test]
