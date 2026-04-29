@@ -72,9 +72,10 @@ pub fn slot_tag(slot: &str) -> &'static str {
 ///
 /// The lexicographic tie-break only matters when two or more slot
 /// strings share rank 99 (any future / unknown slot kind written by
-/// a newer wecanencrypt). Without it, those rows would render in
-/// HashMap-insertion order and produce nondeterministic output --
-/// breaks reproducible-output tests and confuses `diff` consumers.
+/// a newer wecanencrypt). Without it, those rows would preserve
+/// whatever upstream `assocs` / database iteration order produced the
+/// slice, leading to nondeterministic output that breaks
+/// reproducible-output tests and confuses `diff` consumers.
 fn sort_slots_canonically(slots: &mut [String]) {
     slots.sort_by(|a, b| slot_rank(a).cmp(&slot_rank(b)).then_with(|| a.cmp(b)));
 }
@@ -440,11 +441,11 @@ mod tests {
         assert_eq!(slot_tag("attestation"), "?");
     }
 
-    /// Two unknown slot strings share rank 99, so sort_by_key alone
-    /// would leave their relative order up to the underlying sort's
-    /// stability (which `sort_by_key` does NOT guarantee). The
-    /// secondary lexicographic tie-break makes render output
-    /// deterministic across runs.
+    /// Two unknown slot strings share rank 99, so sorting by rank alone
+    /// would preserve their original relative order. That is stable, but
+    /// still not deterministic if the input order of equal-ranked unknown
+    /// slots varies. The secondary lexicographic tie-break makes render
+    /// output deterministic across runs.
     #[test]
     fn sort_slots_canonically_uses_lexicographic_tiebreaker_for_unknowns() {
         let mut xs = vec![
