@@ -65,6 +65,7 @@
 
 pub mod cache;
 pub mod decrypt;
+pub mod describe;
 pub mod encrypt;
 pub mod error;
 pub mod key;
