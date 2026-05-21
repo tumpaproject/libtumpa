@@ -127,8 +127,8 @@ pub fn export_public_armored(store: &KeyStore, fingerprint: &str) -> Result<Stri
 /// Export an Autocrypt-minimised transferable public key (binary).
 ///
 /// Returns the binary OpenPGP bytes the caller should base64-encode into
-/// the `keydata=` attribute of the outbound `Autocrypt:` mail header (see
-/// https://autocrypt.org/level1.html#openpgp-based-key-data).
+/// the `keydata=` attribute of the outbound `Autocrypt:` mail header
+/// (see <https://autocrypt.org/level1.html#openpgp-based-key-data>).
 ///
 /// The key is stripped to just the primary, one UID matching `addr`, and
 /// the subkeys' self-signatures. User Attributes and third-party
@@ -405,7 +405,10 @@ mod tests {
         let store = in_memory_store();
         let err = export_public_for_autocrypt(&store, "DEADBEEF", "x@y.z")
             .expect_err("missing key should error");
-        matches!(err, Error::KeyNotFound(_));
+        assert!(
+            matches!(err, Error::KeyNotFound(_)),
+            "expected Error::KeyNotFound, got: {err:?}"
+        );
     }
 
     #[test]

@@ -5,6 +5,22 @@ use wecanencrypt::KeyStore;
 use crate::error::{Error, Result};
 use crate::store;
 
+/// Guard for the `*_with_hidden` entry points: at least one recipient
+/// must be supplied across the visible and hidden lists. Wecanencrypt
+/// rejects empty-empty too, but failing fast at the libtumpa boundary
+/// gives a clearer error message than the wrapped wecanencrypt error
+/// the caller would otherwise see, and matches the doc-comment contract.
+fn ensure_at_least_one_recipient(visible: &[&str], hidden: &[&str]) -> Result<()> {
+    if visible.is_empty() && hidden.is_empty() {
+        return Err(Error::InvalidInput(
+            "at least one recipient must be supplied across \
+             visible_recipients and hidden_recipients"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve recipient IDs to their public-key bytes, validating each with
 /// [`store::ensure_key_usable_for_encryption`]. Shared by the software and
 /// card sign+encrypt entry points so the validation rules stay in one place.
@@ -90,6 +106,7 @@ pub fn sign_and_encrypt_to_recipients_with_hidden(
     plaintext: &[u8],
     armor: bool,
 ) -> Result<Vec<u8>> {
+    ensure_at_least_one_recipient(visible_recipients, hidden_recipients)?;
     let visible_data = resolve_recipient_keys(store, visible_recipients)?;
     let hidden_data = resolve_recipient_keys(store, hidden_recipients)?;
     let visible_refs: Vec<&[u8]> = visible_data.iter().map(|d| d.as_slice()).collect();
@@ -115,6 +132,7 @@ pub fn encrypt_to_recipients_with_hidden(
     plaintext: &[u8],
     armor: bool,
 ) -> Result<Vec<u8>> {
+    ensure_at_least_one_recipient(visible_recipients, hidden_recipients)?;
     let visible_data = resolve_recipient_keys(store, visible_recipients)?;
     let hidden_data = resolve_recipient_keys(store, hidden_recipients)?;
     let visible_refs: Vec<&[u8]> = visible_data.iter().map(|d| d.as_slice()).collect();
@@ -193,6 +211,7 @@ mod card_encryption {
         plaintext: &[u8],
         armor: bool,
     ) -> Result<Vec<u8>> {
+        ensure_at_least_one_recipient(visible_recipients, hidden_recipients)?;
         let visible_data = resolve_recipient_keys(store, visible_recipients)?;
         let hidden_data = resolve_recipient_keys(store, hidden_recipients)?;
         let visible_refs: Vec<&[u8]> = visible_data.iter().map(|d| d.as_slice()).collect();
@@ -313,6 +332,40 @@ mod tests {
             1,
             "expected exactly one wildcard PKESK (Carol Bcc), got {:?}",
             key_ids
+        );
+    }
+
+    /// Both `*_with_hidden` entry points must reject the empty-empty call
+    /// at the libtumpa boundary with `Error::InvalidInput`, matching the
+    /// doc-comment contract ("at least one recipient must be supplied
+    /// across the two lists"). Letting it through to wecanencrypt would
+    /// surface the same rejection one layer deeper with a wrapped error
+    /// message that's harder for callers to match against.
+    #[test]
+    fn with_hidden_rejects_empty_empty() {
+        let alice = create_key_simple("alice-pw", &["Alice <alice@example.com>"]).unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(alice.public_key.as_bytes()).unwrap();
+
+        let err = sign_and_encrypt_to_recipients_with_hidden(
+            &store,
+            &alice.secret_key,
+            &pw("alice-pw"),
+            &[],
+            &[],
+            b"x",
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "expected Error::InvalidInput, got: {err:?}"
+        );
+
+        let err = encrypt_to_recipients_with_hidden(&store, &[], &[], b"x", true).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "expected Error::InvalidInput, got: {err:?}"
         );
     }
 
