@@ -142,7 +142,7 @@ pub fn export_public_for_autocrypt(
     let (cert_data, _) = store
         .get_key(fingerprint)
         .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
-    Ok(we_export_autocrypt(&cert_data, addr)?)
+    we_export_autocrypt(&cert_data, addr).map_err(Into::into)
 }
 
 /// Add a new UID (`"Name <email>"`) to an existing key.
