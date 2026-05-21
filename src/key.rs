@@ -10,9 +10,10 @@
 
 use chrono::{DateTime, Utc};
 use wecanencrypt::{
-    add_uid as we_add_uid, create_key, parse_key_bytes, revoke_key as we_revoke_key,
-    revoke_uid as we_revoke_uid, update_password, update_primary_expiry, update_subkeys_expiry,
-    CipherSuite, GeneratedKey, KeyInfo, KeyStore, KeyType, SubkeyFlags,
+    add_uid as we_add_uid, create_key, export_public_for_autocrypt as we_export_autocrypt,
+    parse_key_bytes, revoke_key as we_revoke_key, revoke_uid as we_revoke_uid, update_password,
+    update_primary_expiry, update_subkeys_expiry, CipherSuite, GeneratedKey, KeyInfo, KeyStore,
+    KeyType, SubkeyFlags,
 };
 
 use crate::error::{Error, Result};
@@ -121,6 +122,27 @@ pub fn export_public_armored(store: &KeyStore, fingerprint: &str) -> Result<Stri
     store
         .export_key_armored(fingerprint)
         .map_err(|e| Error::KeyStore(format!("export_key_armored: {e}")))
+}
+
+/// Export an Autocrypt-minimised transferable public key (binary).
+///
+/// Returns the binary OpenPGP bytes the caller should base64-encode into
+/// the `keydata=` attribute of the outbound `Autocrypt:` mail header
+/// (see <https://autocrypt.org/level1.html#openpgp-based-key-data>).
+///
+/// The key is stripped to just the primary, one UID matching `addr`, and
+/// the subkeys' self-signatures. User Attributes and third-party
+/// certifications are removed — Autocrypt is per-address and every mail
+/// carries this header, so size discipline matters.
+pub fn export_public_for_autocrypt(
+    store: &KeyStore,
+    fingerprint: &str,
+    addr: &str,
+) -> Result<Vec<u8>> {
+    let (cert_data, _) = store
+        .get_key(fingerprint)
+        .map_err(|e| Error::KeyNotFound(format!("{fingerprint}: {e}")))?;
+    we_export_autocrypt(&cert_data, addr).map_err(Into::into)
 }
 
 /// Add a new UID (`"Name <email>"`) to an existing key.
@@ -353,6 +375,40 @@ mod tests {
 
         let armored = export_public_armored(&store, &info.fingerprint).unwrap();
         assert!(armored.contains("BEGIN PGP PUBLIC KEY BLOCK"));
+    }
+
+    /// Round-trip: the bytes returned by `export_public_for_autocrypt` must
+    /// reparse as a valid OpenPGP key. If they don't, no receiving MUA
+    /// will accept the Autocrypt header.
+    #[test]
+    fn export_for_autocrypt_returns_parseable_binary_key() {
+        let store = in_memory_store();
+        let params = GenerateKeyParams {
+            uids: vec!["Alice <alice@example.com>".into()],
+            ..Default::default()
+        };
+        let info = generate_and_import(&store, params, &pw("pw")).unwrap();
+
+        let keydata =
+            export_public_for_autocrypt(&store, &info.fingerprint, "alice@example.com").unwrap();
+        assert!(
+            !keydata.starts_with(b"-----BEGIN"),
+            "autocrypt keydata MUST be binary, not armored"
+        );
+        let info2 = wecanencrypt::parse_key_bytes(&keydata, false).unwrap();
+        assert_eq!(info2.fingerprint, info.fingerprint);
+        assert_eq!(info2.user_ids.len(), 1);
+    }
+
+    #[test]
+    fn export_for_autocrypt_errors_on_unknown_fingerprint() {
+        let store = in_memory_store();
+        let err = export_public_for_autocrypt(&store, "DEADBEEF", "x@y.z")
+            .expect_err("missing key should error");
+        assert!(
+            matches!(err, Error::KeyNotFound(_)),
+            "expected Error::KeyNotFound, got: {err:?}"
+        );
     }
 
     #[test]
