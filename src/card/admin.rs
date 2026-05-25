@@ -1,8 +1,8 @@
 //! Card administration: PINs, cardholder name, URL, touch modes.
 
 use wecanencrypt::card::{
-    change_admin_pin as we_change_admin_pin, change_user_pin as we_change_user_pin,
-    get_touch_modes as we_get_touch_modes, set_cardholder_name as we_set_name,
+    change_admin_pin as we_change_admin_pin, get_touch_modes as we_get_touch_modes,
+    reset_user_pin as we_reset_user_pin, set_cardholder_name as we_set_name,
     set_public_key_url as we_set_url, set_touch_mode as we_set_touch, KeySlot, TouchMode,
 };
 
@@ -37,10 +37,21 @@ pub fn set_public_key_url(url: &str, admin_pin: &Pin, ident: Option<&str>) -> Re
     we_set_url(url, admin_pin.as_slice(), ident).map_err(|e| Error::Card(e.to_string()))
 }
 
-/// Change the user PIN, proving authorization with the admin PIN.
+/// Set a new user PIN, proving authorization with the admin PIN.
 ///
-/// (The underlying card command verifies the admin PIN and sets a new user
-/// PIN in one shot; tumpa's UI exposes it as "change user PIN using admin".)
+/// Under the hood this issues `RESET RETRY COUNTER` (PW1) after
+/// verifying the admin PIN in the same transaction — so it works
+/// regardless of whether the user PIN is currently blocked. tumpa's UI
+/// exposes this as "Change User PIN" because to the user the effect is
+/// the same: pick a new user PIN using the admin PIN as authorization.
+///
+/// Earlier libtumpa releases routed this through
+/// `wecanencrypt::card::change_user_pin`, which is the wrong APDU:
+/// `CHANGE REFERENCE DATA` requires the *old user PIN* and decrements
+/// PW1's retry counter on every wrong attempt, so passing the admin PIN
+/// quietly blocked the user PIN after three tries. The current
+/// implementation uses `RESET RETRY COUNTER`, which is the correct
+/// command for the admin-authorized flow.
 ///
 /// `ident` selects which card to target; see [`set_cardholder_name`] for
 /// multi-card semantics.
@@ -51,8 +62,16 @@ pub fn change_user_pin(admin_pin: &Pin, new_pin: &Pin, ident: Option<&str>) -> R
             "user PIN must be at least {USER_PIN_MIN_LEN} characters"
         )));
     }
-    we_change_user_pin(admin_pin.as_slice(), new_pin.as_slice(), ident)
+    we_reset_user_pin(admin_pin.as_slice(), new_pin.as_slice(), ident)
         .map_err(|e| Error::Card(e.to_string()))
+}
+
+/// Alias for [`change_user_pin`] that names the underlying card
+/// operation explicitly. Both functions issue `RESET RETRY COUNTER`
+/// (PW1) after verifying the admin PIN, which also unblocks the user
+/// PIN if it had been blocked.
+pub fn reset_user_pin(admin_pin: &Pin, new_pin: &Pin, ident: Option<&str>) -> Result<()> {
+    change_user_pin(admin_pin, new_pin, ident)
 }
 
 /// Change the admin PIN. Requires the current admin PIN.
