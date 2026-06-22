@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "libtumpa"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "card-backend",
@@ -3398,9 +3398,9 @@ dependencies = [
 
 [[package]]
 name = "wecanencrypt"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d31ef55c4c35762827bc7e90452e6871e0428e58fa7fd91c1a36b5ce7f037be"
+checksum = "b5e04bea01ff82b46516374ea38a36b6edac3fb9d9fdba9b1ba62eb027cd556b"
 dependencies = [
  "aes",
  "aes-kw",
