@@ -38,7 +38,8 @@ use crate::store;
 /// line-based output.
 #[derive(Debug, Clone)]
 pub enum VerifyOutcome {
-    /// Signer was found in the keystore and the signature is valid.
+    /// Signer was found in the keystore, is not revoked, and the signature
+    /// is valid.
     Good {
         key_info: KeyInfo,
         /// Verifier fingerprint taken from the signature (may be subkey FP).
@@ -81,6 +82,9 @@ pub fn parse_detached(sig_bytes: &[u8]) -> Result<DetachedSignature> {
 
 /// Verify a detached signature against `data`, looking the signer up in the
 /// supplied keystore.
+///
+/// Revoked primary keys and revoked issuer subkeys produce
+/// [`VerifyOutcome::Bad`].
 pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Result<VerifyOutcome> {
     let detached = parse_detached(sig_bytes)?;
     let sig_config = detached
@@ -101,7 +105,10 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
         return Ok(VerifyOutcome::UnknownKey { key_id });
     };
 
-    let valid = wecanencrypt::verify_bytes_detached(&cert_data, data, sig_bytes).unwrap_or(false);
+    // Enforce the shared `Good` contract locally even though the underlying
+    // detached verifier also rejects revoked signing keys.
+    let valid = !signer_is_revoked(&cert_info, &issuer_ids)
+        && wecanencrypt::verify_bytes_detached(&cert_data, data, sig_bytes).unwrap_or(false);
 
     if valid {
         let verifier_fp = issuer_ids
@@ -136,6 +143,8 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
 /// signature was either by an unknown signer or failed to verify do we
 /// return [`VerifyOutcome::Bad`] (preferred) or
 /// [`VerifyOutcome::UnknownKey`] (if no signer was resolvable at all).
+/// A signature from a revoked primary key or revoked issuer subkey is treated
+/// as [`VerifyOutcome::Bad`], even when its signature bytes are valid.
 pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOutcome> {
     let text = std::str::from_utf8(signed_message)
         .map_err(|_| Error::Verify("cleartext-signed message must be valid UTF-8".into()))?;
@@ -180,6 +189,16 @@ pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOu
             }
             continue;
         };
+
+        // Raw signature verification below does not enforce key revocation.
+        // Reject the resolved signer before cryptographic success can become
+        // a trusted `Good` outcome.
+        if signer_is_revoked(&cert_info, &issuer_ids) {
+            if first_bad.is_none() {
+                first_bad = Some(cert_info);
+            }
+            continue;
+        }
 
         let cert = parse_verifying_cert(&cert_data)?;
         if verify_signature_with_cert(&cert, &issuer_ids, sig, normalized_text.as_bytes()) {
@@ -275,17 +294,104 @@ fn verify_signature_with_cert(
     })
 }
 
+/// Match hexadecimal signature issuer identifiers to a fingerprint or key ID.
+///
+/// OpenPGP hex identifiers are ASCII, so case-insensitive comparison avoids
+/// allocating normalized copies while accepting either encoded case.
 fn issuer_matches_key(issuer_ids: &[String], fingerprint: &str, key_id: &str) -> bool {
-    issuer_ids.iter().any(|id| {
-        let id = id.to_uppercase();
-        id == fingerprint || id == key_id
-    })
+    issuer_ids
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(fingerprint) || id.eq_ignore_ascii_case(key_id))
+}
+
+/// Return whether the primary certificate or the specific signature issuer
+/// subkey is revoked.
+///
+/// A revoked subkey that did not issue this signature must not invalidate a
+/// signature made by another still-usable subkey on the same certificate.
+fn signer_is_revoked(cert_info: &KeyInfo, issuer_ids: &[String]) -> bool {
+    cert_info.is_revoked
+        || cert_info.subkeys.iter().any(|subkey| {
+            subkey.is_revoked && issuer_matches_key(issuer_ids, &subkey.fingerprint, &subkey.key_id)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pgp::composed::{SignedSecretKey, SignedSecretSubKey};
+    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
+    use pgp::ser::Serialize;
+    use pgp::types::{KeyVersion, Password, Timestamp};
+    use rand::thread_rng;
     use wecanencrypt::{create_key_simple, KeyStore};
+
+    /// Parse an armored or binary transferable secret key used by a test.
+    fn parse_secret_key(bytes: &[u8]) -> SignedSecretKey {
+        SignedSecretKey::from_armor_single(Cursor::new(bytes))
+            .or_else(|_| SignedSecretKey::from_bytes(bytes).map(|key| (key, Default::default())))
+            .map(|(key, _)| key)
+            .expect("parse test secret key")
+    }
+
+    /// Append a genuine primary-key-issued revocation to one secret subkey.
+    ///
+    /// The resulting transferable secret key is serialized and imported via
+    /// the public keystore API, exercising real revocation parsing rather than
+    /// mutating cached [`KeyInfo`] metadata in memory.
+    fn revoke_subkey(key: &SignedSecretKey, password: &str, target_index: usize) -> Vec<u8> {
+        let target = &key.secret_subkeys[target_index];
+
+        // Bind the revocation cryptographically to this certificate's primary
+        // key and identify that issuer in standard signature subpackets.
+        let mut config = SignatureConfig::from_key(
+            thread_rng(),
+            &key.primary_key,
+            SignatureType::SubkeyRevocation,
+        )
+        .expect("create subkey revocation config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))
+                .expect("encode revocation creation time"),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(
+                key.primary_key.fingerprint(),
+            ))
+            .expect("encode revocation issuer fingerprint"),
+        ];
+        if key.primary_key.version() <= KeyVersion::V4 {
+            config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::IssuerKeyId(
+                key.primary_key.legacy_key_id(),
+            ))
+            .expect("encode revocation issuer key ID")];
+        }
+
+        // Subkey revocations sign the public forms of the primary and subkey.
+        let revocation = config
+            .sign_subkey_binding(
+                &key.primary_key,
+                key.primary_key.public_key(),
+                &Password::from(password),
+                target.key.public_key(),
+            )
+            .expect("sign subkey revocation");
+
+        // Preserve the original binding signatures and append the revocation
+        // to the selected subkey's packet sequence.
+        let mut subkeys = key.secret_subkeys.clone();
+        let revoked = &mut subkeys[target_index];
+        let mut signatures = revoked.signatures.clone();
+        signatures.push(revocation);
+        *revoked = SignedSecretSubKey::new(revoked.key.clone(), signatures);
+
+        SignedSecretKey::new(
+            key.primary_key.clone(),
+            key.details.clone(),
+            key.public_subkeys.clone(),
+            subkeys,
+        )
+        .to_bytes()
+        .expect("serialize key with revoked signing subkey")
+    }
 
     #[test]
     fn verify_good_signature() {
@@ -296,6 +402,24 @@ mod tests {
         let sig = wecanencrypt::sign_bytes_detached(&key.secret_key, b"hello", "pw").unwrap();
         let outcome = verify_detached(&store, b"hello", sig.as_bytes()).unwrap();
         assert!(matches!(outcome, VerifyOutcome::Good { .. }));
+    }
+
+    #[test]
+    /// Detached verification must enforce the shared non-revoked `Good`
+    /// contract even when the signature predates primary-key revocation.
+    fn verify_detached_rejects_revoked_primary_key() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        // Sign while usable, then import the revoked form of the certificate.
+        let signature = wecanencrypt::sign_bytes_detached(&key.secret_key, b"hello", "pw").unwrap();
+        let revoked = wecanencrypt::revoke_key(&key.secret_key, "pw").unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+
+        let outcome = verify_detached(&store, b"hello", signature.as_bytes()).unwrap();
+        match outcome {
+            VerifyOutcome::Bad { key_info } => assert!(key_info.is_revoked),
+            other => panic!("expected Bad for revoked detached signer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -374,6 +498,121 @@ mod tests {
             matches!(outcome, VerifyOutcome::Good { .. }),
             "verify_inline must accept armored public-only certs from the keystore: got {outcome:?}",
         );
+    }
+
+    #[test]
+    fn verify_inline_rejects_revoked_primary_key() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        // Preserve a signature made while the signer was usable, then replace
+        // the keystore entry with the revoked form of the same certificate.
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let revoked = wecanencrypt::revoke_key(&key.secret_key, "pw").unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+
+        let outcome = verify_inline(&store, &signed).unwrap();
+        match outcome {
+            VerifyOutcome::Bad { key_info } => assert!(key_info.is_revoked),
+            other => panic!("expected Bad for revoked signer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    /// Inline verification must reject a signature whose exact issuer subkey
+    /// has a genuine self-issued revocation in the stored certificate.
+    fn verify_inline_rejects_revoked_issuer_subkey() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let secret_key = parse_secret_key(&key.secret_key);
+
+        // Confirm the fixture was signed by the subkey that is revoked below.
+        let signing_subkey = secret_key
+            .secret_subkeys
+            .iter()
+            .find(|subkey| {
+                subkey
+                    .signatures
+                    .iter()
+                    .any(|signature| signature.key_flags().sign())
+            })
+            .expect("test key must have a signing subkey");
+        let signing_fingerprint = hex::encode_upper(signing_subkey.key.fingerprint().as_bytes());
+        let signing_key_id = hex::encode_upper(signing_subkey.key.legacy_key_id());
+        let text = std::str::from_utf8(&signed).unwrap();
+        let (message, _) = CleartextSignedMessage::from_string(text).unwrap();
+        let issuer_ids = store::extract_issuer_ids(message.signatures()[0].config().unwrap());
+        assert!(issuer_matches_key(
+            &issuer_ids,
+            &signing_fingerprint,
+            &signing_key_id,
+        ));
+
+        // Revoke the exact subkey identified by the cleartext signature.
+        let signing_index = secret_key
+            .secret_subkeys
+            .iter()
+            .position(|subkey| subkey.key.fingerprint() == signing_subkey.key.fingerprint())
+            .unwrap();
+        let revoked = revoke_subkey(&secret_key, "pw", signing_index);
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+
+        let outcome = verify_inline(&store, &signed).unwrap();
+        match outcome {
+            VerifyOutcome::Bad { key_info } => {
+                let issuer = key_info
+                    .subkeys
+                    .iter()
+                    .find(|subkey| subkey.fingerprint == signing_fingerprint)
+                    .expect("revoked issuer subkey must remain in key metadata");
+                assert!(issuer.is_revoked);
+            }
+            other => panic!("expected Bad for revoked issuer subkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    /// Revoking a different component must not invalidate a signature from a
+    /// still-usable signing subkey on the same certificate.
+    fn verify_inline_accepts_signer_when_unrelated_subkey_is_revoked() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let secret_key = parse_secret_key(&key.secret_key);
+        // Select a non-signing component so the signature issuer remains live.
+        let unrelated_index = secret_key
+            .secret_subkeys
+            .iter()
+            .position(|subkey| {
+                !subkey
+                    .signatures
+                    .iter()
+                    .any(|signature| signature.key_flags().sign())
+            })
+            .expect("test key must have a non-signing subkey");
+        let unrelated_fingerprint = hex::encode_upper(
+            secret_key.secret_subkeys[unrelated_index]
+                .key
+                .fingerprint()
+                .as_bytes(),
+        );
+        let revoked = revoke_subkey(&secret_key, "pw", unrelated_index);
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+
+        let outcome = verify_inline(&store, &signed).unwrap();
+        match outcome {
+            VerifyOutcome::Good { key_info, .. } => {
+                // Confirm the control is meaningful: the keystore really did
+                // parse the unrelated subkey as revoked.
+                let unrelated = key_info
+                    .subkeys
+                    .iter()
+                    .find(|subkey| subkey.fingerprint == unrelated_fingerprint)
+                    .expect("revoked unrelated subkey must remain in key metadata");
+                assert!(unrelated.is_revoked);
+            }
+            other => panic!("expected Good with unrelated revoked subkey, got {other:?}"),
+        }
     }
 
     #[test]

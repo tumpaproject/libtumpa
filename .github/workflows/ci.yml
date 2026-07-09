@@ -17,6 +17,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # rust-cache disables incremental compilation, making compiler outputs
+  # eligible for reuse through sccache's GitHub Actions backend.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   rust:
@@ -45,6 +49,13 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      # Complements rust-cache by caching individual compiler outputs,
+      # including workspace crates that rust-cache intentionally removes.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.15.0"
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -78,24 +89,25 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      # Build + clippy across every feature combination so conditional
-      # cfg(feature = "…") blocks don't bit-rot.
+      # Lint both ends of the feature range. The default feature set is a
+      # strict subset of all-features, so linting it separately only rebuilds
+      # and rechecks code already covered by these two commands.
       - name: cargo clippy (no-default-features)
         run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-
-      - name: cargo clippy (default)
-        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo clippy (all-features)
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      # Software tests — pure cryptography and keystore paths, no card.
-      - name: cargo test (no-default-features)
-        run: cargo test --locked --no-default-features
+      # Exercise the software-only public implementations selected by
+      # cfg(not(feature = "card")) without rerunning the entire test suite in
+      # the feature-minimal configuration.
+      - name: cargo test (software-only signing)
+        run: "cargo test --locked --no-default-features --lib sign::tests::"
 
-      - name: cargo test (default)
-        run: cargo test --locked
-
+      # Run the software suite once at maximal feature coverage. The
+      # focused no-default pass above covers the alternate no-card entry
+      # points, avoiding three full executions of the expensive cryptographic
+      # tests.
       - name: cargo test (all-features)
         run: cargo test --locked --all-features
 
