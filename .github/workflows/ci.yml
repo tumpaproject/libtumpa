@@ -98,10 +98,16 @@ jobs:
       - name: cargo clippy (all-features)
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
+      # Exercise the software-only public implementations selected by
+      # cfg(not(feature = "card")) without rerunning the entire test suite in
+      # the feature-minimal configuration.
+      - name: cargo test (software-only signing)
+        run: "cargo test --locked --no-default-features --lib sign::tests::"
+
       # Run the software suite once at maximal feature coverage. The
-      # feature-minimal build remains compile-checked by Clippy above instead
-      # of executing the expensive cryptographic tests three times. This saves
-      # roughly eight minutes on the current CI runner.
+      # focused no-default pass above covers the alternate no-card entry
+      # points, avoiding three full executions of the expensive cryptographic
+      # tests.
       - name: cargo test (all-features)
         run: cargo test --locked --all-features
 
