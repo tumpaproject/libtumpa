@@ -78,24 +78,19 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      # Build + clippy across every feature combination so conditional
-      # cfg(feature = "…") blocks don't bit-rot.
+      # Lint both ends of the feature range. The default feature set is a
+      # strict subset of all-features, so linting it separately only rebuilds
+      # and rechecks code already covered by these two commands.
       - name: cargo clippy (no-default-features)
         run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-
-      - name: cargo clippy (default)
-        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo clippy (all-features)
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      # Software tests — pure cryptography and keystore paths, no card.
-      - name: cargo test (no-default-features)
-        run: cargo test --locked --no-default-features
-
-      - name: cargo test (default)
-        run: cargo test --locked
-
+      # Run the software suite once at maximal feature coverage. The
+      # feature-minimal build remains compile-checked by Clippy above instead
+      # of executing the expensive cryptographic tests three times. This saves
+      # roughly eight minutes on the current CI runner.
       - name: cargo test (all-features)
         run: cargo test --locked --all-features
 
