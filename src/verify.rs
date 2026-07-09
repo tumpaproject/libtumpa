@@ -38,7 +38,8 @@ use crate::store;
 /// line-based output.
 #[derive(Debug, Clone)]
 pub enum VerifyOutcome {
-    /// Signer was found in the keystore and the signature is valid.
+    /// Signer was found in the keystore, is not revoked, and the signature
+    /// is valid.
     Good {
         key_info: KeyInfo,
         /// Verifier fingerprint taken from the signature (may be subkey FP).
@@ -136,6 +137,8 @@ pub fn verify_detached(store: &KeyStore, data: &[u8], sig_bytes: &[u8]) -> Resul
 /// signature was either by an unknown signer or failed to verify do we
 /// return [`VerifyOutcome::Bad`] (preferred) or
 /// [`VerifyOutcome::UnknownKey`] (if no signer was resolvable at all).
+/// A signature from a revoked primary key or revoked issuer subkey is treated
+/// as [`VerifyOutcome::Bad`], even when its signature bytes are valid.
 pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOutcome> {
     let text = std::str::from_utf8(signed_message)
         .map_err(|_| Error::Verify("cleartext-signed message must be valid UTF-8".into()))?;
@@ -180,6 +183,16 @@ pub fn verify_inline(store: &KeyStore, signed_message: &[u8]) -> Result<VerifyOu
             }
             continue;
         };
+
+        // Raw signature verification below does not enforce key revocation.
+        // Reject the resolved signer before cryptographic success can become
+        // a trusted `Good` outcome.
+        if signer_is_revoked(&cert_info, &issuer_ids) {
+            if first_bad.is_none() {
+                first_bad = Some(cert_info);
+            }
+            continue;
+        }
 
         let cert = parse_verifying_cert(&cert_data)?;
         if verify_signature_with_cert(&cert, &issuer_ids, sig, normalized_text.as_bytes()) {
@@ -282,6 +295,18 @@ fn issuer_matches_key(issuer_ids: &[String], fingerprint: &str, key_id: &str) ->
     })
 }
 
+/// Return whether the primary certificate or the specific signature issuer
+/// subkey is revoked.
+///
+/// A revoked subkey that did not issue this signature must not invalidate a
+/// signature made by another still-usable subkey on the same certificate.
+fn signer_is_revoked(cert_info: &KeyInfo, issuer_ids: &[String]) -> bool {
+    cert_info.is_revoked
+        || cert_info.subkeys.iter().any(|subkey| {
+            subkey.is_revoked && issuer_matches_key(issuer_ids, &subkey.fingerprint, &subkey.key_id)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +399,54 @@ mod tests {
             matches!(outcome, VerifyOutcome::Good { .. }),
             "verify_inline must accept armored public-only certs from the keystore: got {outcome:?}",
         );
+    }
+
+    #[test]
+    fn verify_inline_rejects_revoked_primary_key() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        // Preserve a signature made while the signer was usable, then replace
+        // the keystore entry with the revoked form of the same certificate.
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let revoked = wecanencrypt::revoke_key(&key.secret_key, "pw").unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&revoked).unwrap();
+
+        let outcome = verify_inline(&store, &signed).unwrap();
+        match outcome {
+            VerifyOutcome::Bad { key_info } => assert!(key_info.is_revoked),
+            other => panic!("expected Bad for revoked signer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signer_revocation_is_scoped_to_issuer_subkey() {
+        let key = create_key_simple("pw", &["Alice <alice@example.com>"]).unwrap();
+        let signed = wecanencrypt::sign_bytes_cleartext(&key.secret_key, b"hello\n", "pw").unwrap();
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&key.secret_key).unwrap();
+
+        let text = std::str::from_utf8(&signed).unwrap();
+        let (msg, _) = CleartextSignedMessage::from_string(text).unwrap();
+        let issuer_ids = store::extract_issuer_ids(msg.signatures()[0].config().unwrap());
+        let (_, mut key_info) = store::resolve_from_issuer_ids(&store, &issuer_ids)
+            .unwrap()
+            .unwrap();
+
+        let signing_subkey = key_info
+            .subkeys
+            .iter_mut()
+            .find(|subkey| issuer_matches_key(&issuer_ids, &subkey.fingerprint, &subkey.key_id))
+            .expect("cleartext signature should identify its signing subkey");
+        signing_subkey.is_revoked = true;
+
+        assert!(signer_is_revoked(&key_info, &issuer_ids));
+
+        // Revocation on unrelated subkeys must not poison this signature.
+        for subkey in &mut key_info.subkeys {
+            subkey.is_revoked =
+                !issuer_matches_key(&issuer_ids, &subkey.fingerprint, &subkey.key_id);
+        }
+        assert!(!signer_is_revoked(&key_info, &issuer_ids));
     }
 
     #[test]
