@@ -55,8 +55,8 @@ pub fn decrypt_with_key(
 pub enum DecryptVerifyOutcome {
     /// Ciphertext was encrypt-only; no signature to check.
     Unsigned,
-    /// Ciphertext was sign-then-encrypted, signer found in the keystore,
-    /// and the inner signature verified.
+    /// Ciphertext was sign-then-encrypted, the non-revoked signer was found in
+    /// the keystore, and the inner signature verified.
     Good {
         key_info: KeyInfo,
         /// Verifier fingerprint pulled from the signature; may be the
@@ -92,6 +92,69 @@ impl std::fmt::Debug for DecryptVerifyResult {
             )
             .field("outcome", &self.outcome)
             .finish()
+    }
+}
+
+/// Return whether the primary certificate or the exact verifier subkey is
+/// revoked.
+///
+/// Revocation of an unrelated subkey does not invalidate a signature made by
+/// another still-usable key on the same certificate.
+fn signer_is_revoked(key_info: &KeyInfo, verifier_fingerprint: &str) -> bool {
+    key_info.is_revoked
+        || key_info.subkeys.iter().any(|subkey| {
+            subkey.is_revoked
+                && (subkey
+                    .fingerprint
+                    .eq_ignore_ascii_case(verifier_fingerprint)
+                    || subkey.key_id.eq_ignore_ascii_case(verifier_fingerprint))
+        })
+}
+
+/// Map a lower-level cryptographic signature result to libtumpa's trusted
+/// decrypt-and-verify outcome.
+///
+/// The lower API intentionally leaves signer revocation policy to its caller.
+/// Centralizing that policy here keeps the software and card-backed decryption
+/// paths from returning different trust decisions for the same signer.
+fn classify_decrypt_verify_signature(
+    signature: DecryptVerifySignature,
+    resolved_signer: Option<KeyInfo>,
+) -> DecryptVerifyOutcome {
+    match signature {
+        DecryptVerifySignature::Unsigned => DecryptVerifyOutcome::Unsigned,
+        DecryptVerifySignature::Good {
+            mut verifier_fingerprint,
+        } => {
+            // Normalize the lower API's identifier at this public boundary.
+            verifier_fingerprint.make_ascii_uppercase();
+            match resolved_signer {
+                Some(key_info) if signer_is_revoked(&key_info, &verifier_fingerprint) => {
+                    DecryptVerifyOutcome::Bad { key_info }
+                }
+                Some(key_info) => DecryptVerifyOutcome::Good {
+                    key_info,
+                    verifier_fingerprint,
+                },
+                // A cryptographic Good should have invoked the resolver, but
+                // preserve the existing safe fallback if no metadata exists.
+                None => DecryptVerifyOutcome::UnknownKey {
+                    issuer_ids: vec![verifier_fingerprint],
+                },
+            }
+        }
+        DecryptVerifySignature::Bad => match resolved_signer {
+            Some(key_info) => DecryptVerifyOutcome::Bad { key_info },
+            None => DecryptVerifyOutcome::UnknownKey {
+                issuer_ids: Vec::new(),
+            },
+        },
+        DecryptVerifySignature::UnknownKey { mut issuer_ids } => {
+            for id in &mut issuer_ids {
+                id.make_ascii_uppercase();
+            }
+            DecryptVerifyOutcome::UnknownKey { issuer_ids }
+        }
     }
 }
 
@@ -135,42 +198,7 @@ pub fn decrypt_and_verify_with_key(
         })
         .map_err(|e| Error::Decrypt(format!("decrypt_and_verify: {e}")))?;
 
-    let outcome = match result.signature {
-        DecryptVerifySignature::Unsigned => DecryptVerifyOutcome::Unsigned,
-        DecryptVerifySignature::Good {
-            mut verifier_fingerprint,
-        } => {
-            // Defensive: doc contract says uppercase hex. wecanencrypt
-            // already uppercases, but the boundary normalization makes
-            // the libtumpa contract self-enforced.
-            verifier_fingerprint.make_ascii_uppercase();
-            // Wecanencrypt only invokes the resolver when there's a
-            // signature to verify, so on Good we always have a KeyInfo.
-            // If somehow we don't, fall through to UnknownKey rather than
-            // panic.
-            match resolved_signer {
-                Some(key_info) => DecryptVerifyOutcome::Good {
-                    key_info,
-                    verifier_fingerprint,
-                },
-                None => DecryptVerifyOutcome::UnknownKey {
-                    issuer_ids: vec![verifier_fingerprint],
-                },
-            }
-        }
-        DecryptVerifySignature::Bad => match resolved_signer {
-            Some(key_info) => DecryptVerifyOutcome::Bad { key_info },
-            None => DecryptVerifyOutcome::UnknownKey {
-                issuer_ids: Vec::new(),
-            },
-        },
-        DecryptVerifySignature::UnknownKey { mut issuer_ids } => {
-            for id in &mut issuer_ids {
-                id.make_ascii_uppercase();
-            }
-            DecryptVerifyOutcome::UnknownKey { issuer_ids }
-        }
-    };
+    let outcome = classify_decrypt_verify_signature(result.signature, resolved_signer);
 
     Ok(DecryptVerifyResult {
         plaintext: Zeroizing::new(result.plaintext),
@@ -289,38 +317,8 @@ mod card_decryption {
         )
         .map_err(|e| Error::Card(format!("decrypt_and_verify_on_card: {e}")))?;
 
-        let outcome = match result.signature {
-            wecanencrypt::DecryptVerifySignature::Unsigned => super::DecryptVerifyOutcome::Unsigned,
-            wecanencrypt::DecryptVerifySignature::Good {
-                mut verifier_fingerprint,
-            } => {
-                // Defensive uppercase to match the API contract; wecanencrypt
-                // already does this but a normalize-at-the-boundary keeps
-                // the libtumpa guarantee self-enforced.
-                verifier_fingerprint.make_ascii_uppercase();
-                match resolved_signer {
-                    Some(key_info) => super::DecryptVerifyOutcome::Good {
-                        key_info,
-                        verifier_fingerprint,
-                    },
-                    None => super::DecryptVerifyOutcome::UnknownKey {
-                        issuer_ids: vec![verifier_fingerprint],
-                    },
-                }
-            }
-            wecanencrypt::DecryptVerifySignature::Bad => match resolved_signer {
-                Some(key_info) => super::DecryptVerifyOutcome::Bad { key_info },
-                None => super::DecryptVerifyOutcome::UnknownKey {
-                    issuer_ids: Vec::new(),
-                },
-            },
-            wecanencrypt::DecryptVerifySignature::UnknownKey { mut issuer_ids } => {
-                for id in &mut issuer_ids {
-                    id.make_ascii_uppercase();
-                }
-                super::DecryptVerifyOutcome::UnknownKey { issuer_ids }
-            }
-        };
+        // Share the same signer-revocation boundary as software decryption.
+        let outcome = super::classify_decrypt_verify_signature(result.signature, resolved_signer);
 
         Ok(super::DecryptVerifyResult {
             plaintext: Zeroizing::new(result.plaintext),
@@ -394,6 +392,52 @@ mod tests {
             }
             other => panic!("expected Good, got {other:?}"),
         }
+    }
+
+    /// A signature made before primary-key revocation must not retain a
+    /// trusted `Good` outcome after the revoked certificate is imported.
+    #[test]
+    fn decrypt_and_verify_with_key_rejects_revoked_signer() {
+        let alice = create_key_simple("alice-pw", &["Alice <a@example.com>"]).unwrap();
+        let bob = create_key_simple("bob-pw", &["Bob <b@example.com>"]).unwrap();
+        let ciphertext = sign_and_encrypt_to_multiple(
+            &alice.secret_key,
+            "alice-pw",
+            &[bob.public_key.as_bytes()],
+            b"signed before revocation",
+            true,
+        )
+        .unwrap();
+        let revoked_alice = wecanencrypt::revoke_key(&alice.secret_key, "alice-pw").unwrap();
+
+        let store = KeyStore::open_in_memory().unwrap();
+        store.import_key(&bob.secret_key).unwrap();
+        store.import_key(&revoked_alice).unwrap();
+
+        let result =
+            decrypt_and_verify_with_key(&store, &bob.secret_key, &ciphertext, &pw("bob-pw"))
+                .unwrap();
+        assert_eq!(result.plaintext.as_slice(), b"signed before revocation");
+        match result.outcome {
+            DecryptVerifyOutcome::Bad { key_info } => assert!(key_info.is_revoked),
+            other => panic!("expected Bad for revoked signer, got {other:?}"),
+        }
+    }
+
+    /// Revocation is scoped to the key that produced the signature, not every
+    /// subkey attached to the same certificate.
+    #[test]
+    fn signer_revocation_is_scoped_to_verifier_fingerprint() {
+        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
+        let mut key_info = wecanencrypt::parse_key_bytes(&key.secret_key, true).unwrap();
+        let verifier_fingerprint = key_info.subkeys[0].fingerprint.clone();
+
+        key_info.subkeys[0].is_revoked = true;
+        assert!(signer_is_revoked(&key_info, &verifier_fingerprint));
+
+        key_info.subkeys[0].is_revoked = false;
+        key_info.subkeys[1].is_revoked = true;
+        assert!(!signer_is_revoked(&key_info, &verifier_fingerprint));
     }
 
     #[test]
