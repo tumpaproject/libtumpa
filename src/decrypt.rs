@@ -63,8 +63,9 @@ pub enum DecryptVerifyOutcome {
         /// fingerprint of the primary key or of a signing subkey.
         verifier_fingerprint: String,
     },
-    /// Ciphertext was sign-then-encrypted, signer key was in the
-    /// keystore, but the inner signature failed to verify.
+    /// Ciphertext was sign-then-encrypted and the signer key was in the
+    /// keystore, but the inner signature failed to verify or the signer was
+    /// revoked.
     Bad { key_info: KeyInfo },
     /// Ciphertext was sign-then-encrypted, but no signer is present in
     /// the keystore.
@@ -430,13 +431,33 @@ mod tests {
     fn signer_revocation_is_scoped_to_verifier_fingerprint() {
         let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
         let mut key_info = wecanencrypt::parse_key_bytes(&key.secret_key, true).unwrap();
-        let verifier_fingerprint = key_info.subkeys[0].fingerprint.clone();
+        let verifier_fingerprint = key_info
+            .subkeys
+            .first()
+            .expect("generated key must contain a signing subkey")
+            .fingerprint
+            .clone();
 
-        key_info.subkeys[0].is_revoked = true;
+        key_info
+            .subkeys
+            .iter_mut()
+            .find(|subkey| subkey.fingerprint == verifier_fingerprint)
+            .expect("verifier subkey must still be present")
+            .is_revoked = true;
         assert!(signer_is_revoked(&key_info, &verifier_fingerprint));
 
-        key_info.subkeys[0].is_revoked = false;
-        key_info.subkeys[1].is_revoked = true;
+        key_info
+            .subkeys
+            .iter_mut()
+            .find(|subkey| subkey.fingerprint == verifier_fingerprint)
+            .expect("verifier subkey must still be present")
+            .is_revoked = false;
+        key_info
+            .subkeys
+            .iter_mut()
+            .find(|subkey| subkey.fingerprint != verifier_fingerprint)
+            .expect("generated key must contain an unrelated subkey")
+            .is_revoked = true;
         assert!(!signer_is_revoked(&key_info, &verifier_fingerprint));
     }
 
