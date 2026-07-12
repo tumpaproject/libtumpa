@@ -6,6 +6,7 @@ use wecanencrypt::{DecryptVerifySignature, KeyInfo, KeyStore};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+use crate::revocation::signer_is_revoked;
 use crate::store;
 use crate::Passphrase;
 
@@ -96,22 +97,6 @@ impl std::fmt::Debug for DecryptVerifyResult {
     }
 }
 
-/// Return whether the primary certificate or the exact verifier subkey is
-/// revoked.
-///
-/// Revocation of an unrelated subkey does not invalidate a signature made by
-/// another still-usable key on the same certificate.
-fn signer_is_revoked(key_info: &KeyInfo, verifier_fingerprint: &str) -> bool {
-    key_info.is_revoked
-        || key_info.subkeys.iter().any(|subkey| {
-            subkey.is_revoked
-                && (subkey
-                    .fingerprint
-                    .eq_ignore_ascii_case(verifier_fingerprint)
-                    || subkey.key_id.eq_ignore_ascii_case(verifier_fingerprint))
-        })
-}
-
 /// Map a lower-level cryptographic signature result to libtumpa's trusted
 /// decrypt-and-verify outcome.
 ///
@@ -130,7 +115,12 @@ fn classify_decrypt_verify_signature(
             // Normalize the lower API's identifier at this public boundary.
             verifier_fingerprint.make_ascii_uppercase();
             match resolved_signer {
-                Some(key_info) if signer_is_revoked(&key_info, &verifier_fingerprint) => {
+                Some(key_info)
+                    if signer_is_revoked(
+                        &key_info,
+                        std::slice::from_ref(&verifier_fingerprint),
+                    ) =>
+                {
                     DecryptVerifyOutcome::Bad { key_info }
                 }
                 Some(key_info) => DecryptVerifyOutcome::Good {
@@ -336,6 +326,8 @@ pub use card_decryption::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::revocation::test_support::{parse_secret_key, revoke_subkey};
+    use pgp::types::KeyDetails;
     use wecanencrypt::{create_key_simple, encrypt_bytes, sign_and_encrypt_to_multiple, KeyStore};
 
     fn pw(s: &str) -> Passphrase {
@@ -425,40 +417,75 @@ mod tests {
         }
     }
 
-    /// Revocation is scoped to the key that produced the signature, not every
-    /// subkey attached to the same certificate.
+    /// Decrypt-and-verify must reject a signature whose exact verifier subkey
+    /// has a genuine self-issued revocation in the stored certificate.
     #[test]
-    fn signer_revocation_is_scoped_to_verifier_fingerprint() {
-        let key = create_key_simple("pw", &["Alice <a@example.com>"]).unwrap();
-        let mut key_info = wecanencrypt::parse_key_bytes(&key.secret_key, true).unwrap();
-        let verifier_fingerprint = key_info
-            .subkeys
-            .first()
-            .expect("generated key must contain a signing subkey")
-            .fingerprint
-            .clone();
+    fn decrypt_and_verify_with_key_rejects_revoked_signing_subkey() {
+        let alice = create_key_simple("alice-pw", &["Alice <a@example.com>"]).unwrap();
+        let bob = create_key_simple("bob-pw", &["Bob <b@example.com>"]).unwrap();
+        let ciphertext = sign_and_encrypt_to_multiple(
+            &alice.secret_key,
+            "alice-pw",
+            &[bob.public_key.as_bytes()],
+            b"signed before subkey revocation",
+            true,
+        )
+        .unwrap();
 
-        key_info
-            .subkeys
-            .iter_mut()
-            .find(|subkey| subkey.fingerprint == verifier_fingerprint)
-            .expect("verifier subkey must still be present")
-            .is_revoked = true;
-        assert!(signer_is_revoked(&key_info, &verifier_fingerprint));
+        // Resolve and verify once with the live certificate to obtain the
+        // exact verifier selected by the real sign-and-encrypt path.
+        let live_store = KeyStore::open_in_memory().unwrap();
+        live_store.import_key(&bob.secret_key).unwrap();
+        live_store.import_key(alice.public_key.as_bytes()).unwrap();
+        let live =
+            decrypt_and_verify_with_key(&live_store, &bob.secret_key, &ciphertext, &pw("bob-pw"))
+                .unwrap();
+        let verifier_fingerprint = match live.outcome {
+            DecryptVerifyOutcome::Good {
+                verifier_fingerprint,
+                ..
+            } => verifier_fingerprint,
+            other => panic!("expected Good before subkey revocation, got {other:?}"),
+        };
 
-        key_info
-            .subkeys
-            .iter_mut()
-            .find(|subkey| subkey.fingerprint == verifier_fingerprint)
-            .expect("verifier subkey must still be present")
-            .is_revoked = false;
-        key_info
-            .subkeys
-            .iter_mut()
-            .find(|subkey| subkey.fingerprint != verifier_fingerprint)
-            .expect("generated key must contain an unrelated subkey")
-            .is_revoked = true;
-        assert!(!signer_is_revoked(&key_info, &verifier_fingerprint));
+        // Append a genuine revocation for that exact subkey, then import the
+        // resulting certificate through the public keystore API.
+        let secret_key = parse_secret_key(&alice.secret_key);
+        let signing_index = secret_key
+            .secret_subkeys
+            .iter()
+            .position(|subkey| {
+                hex::encode_upper(subkey.key.fingerprint().as_bytes()) == verifier_fingerprint
+            })
+            .expect("signature verifier must identify a signing subkey");
+        let revoked_alice = revoke_subkey(&secret_key, "alice-pw", signing_index);
+        let revoked_store = KeyStore::open_in_memory().unwrap();
+        revoked_store.import_key(&bob.secret_key).unwrap();
+        revoked_store.import_key(&revoked_alice).unwrap();
+
+        let result = decrypt_and_verify_with_key(
+            &revoked_store,
+            &bob.secret_key,
+            &ciphertext,
+            &pw("bob-pw"),
+        )
+        .unwrap();
+        assert_eq!(
+            result.plaintext.as_slice(),
+            b"signed before subkey revocation"
+        );
+        match result.outcome {
+            DecryptVerifyOutcome::Bad { key_info } => {
+                assert!(!key_info.is_revoked);
+                let verifier = key_info
+                    .subkeys
+                    .iter()
+                    .find(|subkey| subkey.fingerprint == verifier_fingerprint)
+                    .expect("revoked verifier subkey must remain in key metadata");
+                assert!(verifier.is_revoked);
+            }
+            other => panic!("expected Bad for revoked verifier subkey, got {other:?}"),
+        }
     }
 
     #[test]
