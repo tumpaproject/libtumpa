@@ -70,6 +70,7 @@ pub mod encrypt;
 pub mod error;
 pub mod key;
 pub mod paths;
+mod revocation;
 pub mod sign;
 pub mod store;
 pub mod verify;

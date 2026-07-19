@@ -29,6 +29,7 @@ use pgp::types::KeyDetails;
 use wecanencrypt::{KeyInfo, KeyStore};
 
 use crate::error::{Error, Result};
+use crate::revocation::{issuer_matches_key, signer_is_revoked};
 use crate::store;
 
 /// Outcome of verifying a detached signature.
@@ -294,104 +295,11 @@ fn verify_signature_with_cert(
     })
 }
 
-/// Match hexadecimal signature issuer identifiers to a fingerprint or key ID.
-///
-/// OpenPGP hex identifiers are ASCII, so case-insensitive comparison avoids
-/// allocating normalized copies while accepting either encoded case.
-fn issuer_matches_key(issuer_ids: &[String], fingerprint: &str, key_id: &str) -> bool {
-    issuer_ids
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(fingerprint) || id.eq_ignore_ascii_case(key_id))
-}
-
-/// Return whether the primary certificate or the specific signature issuer
-/// subkey is revoked.
-///
-/// A revoked subkey that did not issue this signature must not invalidate a
-/// signature made by another still-usable subkey on the same certificate.
-fn signer_is_revoked(cert_info: &KeyInfo, issuer_ids: &[String]) -> bool {
-    cert_info.is_revoked
-        || cert_info.subkeys.iter().any(|subkey| {
-            subkey.is_revoked && issuer_matches_key(issuer_ids, &subkey.fingerprint, &subkey.key_id)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgp::composed::{SignedSecretKey, SignedSecretSubKey};
-    use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
-    use pgp::ser::Serialize;
-    use pgp::types::{KeyVersion, Password, Timestamp};
-    use rand::thread_rng;
+    use crate::revocation::test_support::{parse_secret_key, revoke_subkey};
     use wecanencrypt::{create_key_simple, KeyStore};
-
-    /// Parse an armored or binary transferable secret key used by a test.
-    fn parse_secret_key(bytes: &[u8]) -> SignedSecretKey {
-        SignedSecretKey::from_armor_single(Cursor::new(bytes))
-            .or_else(|_| SignedSecretKey::from_bytes(bytes).map(|key| (key, Default::default())))
-            .map(|(key, _)| key)
-            .expect("parse test secret key")
-    }
-
-    /// Append a genuine primary-key-issued revocation to one secret subkey.
-    ///
-    /// The resulting transferable secret key is serialized and imported via
-    /// the public keystore API, exercising real revocation parsing rather than
-    /// mutating cached [`KeyInfo`] metadata in memory.
-    fn revoke_subkey(key: &SignedSecretKey, password: &str, target_index: usize) -> Vec<u8> {
-        let target = &key.secret_subkeys[target_index];
-
-        // Bind the revocation cryptographically to this certificate's primary
-        // key and identify that issuer in standard signature subpackets.
-        let mut config = SignatureConfig::from_key(
-            thread_rng(),
-            &key.primary_key,
-            SignatureType::SubkeyRevocation,
-        )
-        .expect("create subkey revocation config");
-        config.hashed_subpackets = vec![
-            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::now()))
-                .expect("encode revocation creation time"),
-            Subpacket::regular(SubpacketData::IssuerFingerprint(
-                key.primary_key.fingerprint(),
-            ))
-            .expect("encode revocation issuer fingerprint"),
-        ];
-        if key.primary_key.version() <= KeyVersion::V4 {
-            config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::IssuerKeyId(
-                key.primary_key.legacy_key_id(),
-            ))
-            .expect("encode revocation issuer key ID")];
-        }
-
-        // Subkey revocations sign the public forms of the primary and subkey.
-        let revocation = config
-            .sign_subkey_binding(
-                &key.primary_key,
-                key.primary_key.public_key(),
-                &Password::from(password),
-                target.key.public_key(),
-            )
-            .expect("sign subkey revocation");
-
-        // Preserve the original binding signatures and append the revocation
-        // to the selected subkey's packet sequence.
-        let mut subkeys = key.secret_subkeys.clone();
-        let revoked = &mut subkeys[target_index];
-        let mut signatures = revoked.signatures.clone();
-        signatures.push(revocation);
-        *revoked = SignedSecretSubKey::new(revoked.key.clone(), signatures);
-
-        SignedSecretKey::new(
-            key.primary_key.clone(),
-            key.details.clone(),
-            key.public_subkeys.clone(),
-            subkeys,
-        )
-        .to_bytes()
-        .expect("serialize key with revoked signing subkey")
-    }
 
     #[test]
     fn verify_good_signature() {
