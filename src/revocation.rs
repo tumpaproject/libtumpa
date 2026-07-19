@@ -46,7 +46,7 @@ pub(crate) mod test_support {
     use pgp::composed::{Deserializable, SignedSecretKey, SignedSecretSubKey};
     use pgp::packet::{SignatureConfig, SignatureType, Subpacket, SubpacketData};
     use pgp::ser::Serialize;
-    use pgp::types::{KeyDetails, KeyVersion, Password, Timestamp};
+    use pgp::types::{KeyDetails as _, KeyVersion, Password, Timestamp};
     use rand::thread_rng;
 
     /// Parse an armored or binary transferable secret key used by a test.

@@ -327,7 +327,7 @@ pub use card_decryption::{
 mod tests {
     use super::*;
     use crate::revocation::test_support::{parse_secret_key, revoke_subkey};
-    use pgp::types::KeyDetails;
+    use pgp::types::KeyDetails as _;
     use wecanencrypt::{create_key_simple, encrypt_bytes, sign_and_encrypt_to_multiple, KeyStore};
 
     fn pw(s: &str) -> Passphrase {
