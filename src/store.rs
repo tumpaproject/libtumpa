@@ -19,8 +19,8 @@ const PRIVATE_DATABASE_MODE: u32 = 0o600;
 /// An explicitly named immediate database directory and the database file must
 /// be inaccessible to group/other users. A keystore named directly in the
 /// current directory retains the previous behavior of validating only the
-/// database file. Symlinks are rejected so the path checked here is the path
-/// SQLite subsequently opens.
+/// database file. Existing symlinks are rejected during validation, while
+/// exclusive file creation avoids following a symlink at creation time.
 #[cfg(unix)]
 fn prepare_keystore_path(db_path: &Path) -> Result<()> {
     use std::fs::{DirBuilder, OpenOptions};
@@ -28,35 +28,33 @@ fn prepare_keystore_path(db_path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     if let Some(parent) = explicit_keystore_parent(db_path) {
-        match std::fs::symlink_metadata(parent) {
-            Ok(_) => validate_private_keystore_directory(parent)?,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                log::debug!("open_keystore: creating private parent dir {:?}", parent);
-                let mut builder = DirBuilder::new();
-                builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
-                builder.create(parent)?;
-                validate_private_keystore_directory(parent)?;
-            }
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
+        match builder.create(parent) {
+            Ok(()) => {}
+            // Another opener may have created the path concurrently. Accept
+            // that only after the same type, symlink, and mode validation.
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
+        validate_private_keystore_directory(parent)?;
     }
 
-    match std::fs::symlink_metadata(db_path) {
-        Ok(_) => validate_private_keystore_database(db_path)?,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            // Pre-create the database privately rather than letting SQLite use
-            // the ambient umask. `create_new` also prevents following a
-            // symlink introduced between the metadata check and this open.
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(PRIVATE_DATABASE_MODE)
-                .open(db_path)?;
-            validate_private_keystore_database(db_path)?;
-        }
+    // Pre-create the database privately rather than letting SQLite use the
+    // ambient umask. Exclusive creation is atomic; a concurrent winner is
+    // accepted only after validating the path it created.
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_DATABASE_MODE)
+        .open(db_path)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
+    validate_private_keystore_database(db_path)?;
 
     Ok(())
 }
@@ -492,6 +490,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
+    use std::sync::{Arc, Barrier};
+    #[cfg(unix)]
+    use std::thread;
 
     use chrono::{Duration, Utc};
     use wecanencrypt::{
@@ -499,11 +501,14 @@ mod tests {
         SubkeyFlags,
     };
 
-    #[cfg(unix)]
-    use super::explicit_keystore_parent;
     use super::{
         ensure_key_usable_for_encryption, ensure_key_usable_for_signing, open_keystore,
         resolve_recipient, resolve_signer,
+    };
+    #[cfg(unix)]
+    use super::{
+        explicit_keystore_parent, prepare_keystore_path, PRIVATE_DATABASE_MODE,
+        PRIVATE_DIRECTORY_MODE,
     };
     use crate::error::Error;
 
@@ -520,6 +525,39 @@ mod tests {
             explicit_keystore_parent(Path::new("private/keys.db")),
             Some(Path::new("private"))
         );
+    }
+
+    /// Multiple openers racing to create the same private paths must accept a
+    /// valid winner rather than failing with `AlreadyExists`.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_keystore_path_tolerates_concurrent_creation() {
+        const WORKERS: usize = 16;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("private-keystore");
+        let database = parent.join("keys.db");
+        let barrier = Arc::new(Barrier::new(WORKERS));
+
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let database = database.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    prepare_keystore_path(&database)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let parent_mode = fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        let database_mode = fs::metadata(&database).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, PRIVATE_DIRECTORY_MODE);
+        assert_eq!(database_mode, PRIVATE_DATABASE_MODE);
     }
 
     /// Persistent keystores must not inherit group/world access from the
