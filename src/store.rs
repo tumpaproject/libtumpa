@@ -16,30 +16,29 @@ const PRIVATE_DATABASE_MODE: u32 = 0o600;
 
 /// Prepare and validate the persistent keystore path on Unix.
 ///
-/// The immediate database directory and file must be inaccessible to
-/// group/other users. Symlinks are rejected so the path checked here is the
-/// path SQLite subsequently opens.
+/// An explicitly named immediate database directory and the database file must
+/// be inaccessible to group/other users. A keystore named directly in the
+/// current directory retains the previous behavior of validating only the
+/// database file. Symlinks are rejected so the path checked here is the path
+/// SQLite subsequently opens.
 #[cfg(unix)]
 fn prepare_keystore_path(db_path: &Path) -> Result<()> {
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::ErrorKind;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-    let parent = db_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    match std::fs::symlink_metadata(parent) {
-        Ok(_) => validate_private_keystore_directory(parent)?,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            log::debug!("open_keystore: creating private parent dir {:?}", parent);
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
-            builder.create(parent)?;
-            validate_private_keystore_directory(parent)?;
+    if let Some(parent) = explicit_keystore_parent(db_path) {
+        match std::fs::symlink_metadata(parent) {
+            Ok(_) => validate_private_keystore_directory(parent)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                log::debug!("open_keystore: creating private parent dir {:?}", parent);
+                let mut builder = DirBuilder::new();
+                builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
+                builder.create(parent)?;
+                validate_private_keystore_directory(parent)?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     }
 
     match std::fs::symlink_metadata(db_path) {
@@ -62,8 +61,16 @@ fn prepare_keystore_path(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return a parent only when the caller named a directory other than the CWD.
+#[cfg(unix)]
+fn explicit_keystore_parent(db_path: &Path) -> Option<&Path> {
+    db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty() && *path != Path::new("."))
+}
+
 /// Preserve the existing platform-native creation behavior where Unix mode
-/// and ownership metadata are unavailable.
+/// metadata is unavailable.
 #[cfg(not(unix))]
 fn prepare_keystore_path(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
@@ -133,8 +140,10 @@ fn unsafe_keystore_path(path: &Path, reason: &str) -> Error {
 /// [`paths::default_keystore_path`].
 ///
 /// Creates the parent directory and database file if they don't exist.
-/// On Unix, newly created paths use `0700`/`0600`, and unsafe existing
-/// directories, files, permissions, or symlinks are rejected.
+/// On Unix, newly created explicitly named parent directories use `0700` and
+/// database files use `0600`; unsafe existing paths, permissions, or symlinks
+/// are rejected. A database named directly in the current directory validates
+/// only the database file, preserving the library's existing behavior.
 ///
 /// Ownership is intentionally not enforced here. The legitimate owner can be
 /// deployment-specific for service accounts, containers, and managed mounts,
@@ -481,6 +490,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::Path;
 
     use chrono::{Duration, Utc};
     use wecanencrypt::{
@@ -488,6 +499,8 @@ mod tests {
         SubkeyFlags,
     };
 
+    #[cfg(unix)]
+    use super::explicit_keystore_parent;
     use super::{
         ensure_key_usable_for_encryption, ensure_key_usable_for_signing, open_keystore,
         resolve_recipient, resolve_signer,
@@ -495,6 +508,19 @@ mod tests {
     use crate::error::Error;
 
     const TEST_PASSWORD: &str = "test-password";
+
+    /// Basename and explicit-CWD paths must not impose a private-mode policy
+    /// on the process's current working directory.
+    #[cfg(unix)]
+    #[test]
+    fn current_directory_keystore_has_no_explicit_parent() {
+        assert_eq!(explicit_keystore_parent(Path::new("keys.db")), None);
+        assert_eq!(explicit_keystore_parent(Path::new("./keys.db")), None);
+        assert_eq!(
+            explicit_keystore_parent(Path::new("private/keys.db")),
+            Some(Path::new("private"))
+        );
+    }
 
     /// Persistent keystores must not inherit group/world access from the
     /// process umask or their surrounding filesystem layout.
