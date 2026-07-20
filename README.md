@@ -23,6 +23,12 @@ dispatch, and (optionally) WKD fetch + VKS upload/verify.
   compile.
 - **Functional API.** Free functions over `&KeyStore`. Types are
   re-exported from `wecanencrypt` where possible.
+- **Deployment-owned keystore identity.** On Unix, `store::open_keystore`
+  creates private `0700`/`0600` paths and rejects group/other access and
+  symlinks. It deliberately does not enforce a file-owning UID because the
+  legitimate owner varies for service accounts, containers, and managed
+  mounts. Applications with an ownership policy must validate it before
+  opening the keystore.
 
 ## Features
 

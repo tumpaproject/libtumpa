@@ -9,10 +9,142 @@ use wecanencrypt::{KeyInfo, KeyStore, KeyType, SubkeyInfo};
 use crate::error::{Error, Result};
 use crate::paths;
 
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_DATABASE_MODE: u32 = 0o600;
+
+/// Prepare and validate the persistent keystore path on Unix.
+///
+/// The immediate database directory and file must be inaccessible to
+/// group/other users. Symlinks are rejected so the path checked here is the
+/// path SQLite subsequently opens.
+#[cfg(unix)]
+fn prepare_keystore_path(db_path: &Path) -> Result<()> {
+    use std::fs::{DirBuilder, OpenOptions};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let parent = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => validate_private_keystore_directory(parent)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            log::debug!("open_keystore: creating private parent dir {:?}", parent);
+            let mut builder = DirBuilder::new();
+            builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
+            builder.create(parent)?;
+            validate_private_keystore_directory(parent)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    match std::fs::symlink_metadata(db_path) {
+        Ok(_) => validate_private_keystore_database(db_path)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // Pre-create the database privately rather than letting SQLite use
+            // the ambient umask. `create_new` also prevents following a
+            // symlink introduced between the metadata check and this open.
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(PRIVATE_DATABASE_MODE)
+                .open(db_path)?;
+            validate_private_keystore_database(db_path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+/// Preserve the existing platform-native creation behavior where Unix mode
+/// and ownership metadata are unavailable.
+#[cfg(not(unix))]
+fn prepare_keystore_path(db_path: &Path) -> Result<()> {
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            log::debug!("open_keystore: creating parent dir {:?}", parent);
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate that `path` is a private directory.
+#[cfg(unix)]
+fn validate_private_keystore_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(unsafe_keystore_path(path, "directory is a symbolic link"));
+    }
+    if !metadata.is_dir() {
+        return Err(unsafe_keystore_path(path, "parent is not a directory"));
+    }
+    validate_private_keystore_metadata(path, &metadata, "directory")
+}
+
+/// Validate that `path` is a private regular file.
+#[cfg(unix)]
+fn validate_private_keystore_database(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(unsafe_keystore_path(path, "database is a symbolic link"));
+    }
+    if !metadata.is_file() {
+        return Err(unsafe_keystore_path(path, "database is not a regular file"));
+    }
+    validate_private_keystore_metadata(path, &metadata, "database")
+}
+
+/// Validate the absence of group/other access.
+#[cfg(unix)]
+fn validate_private_keystore_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    kind: &str,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(unsafe_keystore_path(
+            path,
+            &format!("{kind} has unsafe permissions {mode:03o}; group/other access is forbidden"),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unsafe_keystore_path(path: &Path, reason: &str) -> Error {
+    Error::KeyStore(format!(
+        "refusing unsafe keystore path {:?}: {reason}",
+        path
+    ))
+}
+
 /// Open the tumpa keystore at the given path or fall back to
 /// [`paths::default_keystore_path`].
 ///
 /// Creates the parent directory and database file if they don't exist.
+/// On Unix, newly created paths use `0700`/`0600`, and unsafe existing
+/// directories, files, permissions, or symlinks are rejected.
+///
+/// Ownership is intentionally not enforced here. The legitimate owner can be
+/// deployment-specific for service accounts, containers, and managed mounts,
+/// and process-identity checks are not portable. Applications that require an
+/// owner policy should validate it before calling this function.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be created or opened, or when Unix
+/// type/mode validation fails.
 pub fn open_keystore(path: Option<&Path>) -> Result<KeyStore> {
     let db_path: PathBuf = match path {
         Some(p) => p.to_path_buf(),
@@ -27,15 +159,12 @@ pub fn open_keystore(path: Option<&Path>) -> Result<KeyStore> {
         db_path.metadata().ok().map(|m| m.len()),
     );
 
-    if let Some(parent) = db_path.parent() {
-        if !parent.exists() {
-            log::debug!("open_keystore: creating parent dir {:?}", parent);
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    prepare_keystore_path(&db_path)?;
 
     let ks = KeyStore::open(&db_path)
         .map_err(|e| Error::KeyStore(format!("Failed to open {:?}: {e}", db_path)))?;
+    #[cfg(unix)]
+    validate_private_keystore_database(&db_path)?;
     log::debug!("open_keystore: opened OK ({:?})", db_path);
     Ok(ks)
 }
@@ -348,6 +477,11 @@ pub fn ensure_key_usable_for_encryption(key_info: &KeyInfo) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use chrono::{Duration, Utc};
     use wecanencrypt::{
         create_key, create_key_simple, parse_key_bytes, revoke_key, CipherSuite, KeyStore,
@@ -355,12 +489,101 @@ mod tests {
     };
 
     use super::{
-        ensure_key_usable_for_encryption, ensure_key_usable_for_signing, resolve_recipient,
-        resolve_signer,
+        ensure_key_usable_for_encryption, ensure_key_usable_for_signing, open_keystore,
+        resolve_recipient, resolve_signer,
     };
     use crate::error::Error;
 
     const TEST_PASSWORD: &str = "test-password";
+
+    /// Persistent keystores must not inherit group/world access from the
+    /// process umask or their surrounding filesystem layout.
+    #[cfg(unix)]
+    #[test]
+    fn open_keystore_creates_private_directory_and_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("private-keystore");
+        let database = parent.join("keys.db");
+
+        drop(open_keystore(Some(&database)).unwrap());
+
+        let parent_mode = fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        let database_mode = fs::metadata(&database).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(database_mode, 0o600);
+
+        drop(open_keystore(Some(&database)).unwrap());
+    }
+
+    /// Opening an existing database must fail closed instead of silently
+    /// accepting key material exposed to other local users.
+    #[cfg(unix)]
+    #[test]
+    fn open_keystore_rejects_unsafe_existing_database_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("private-keystore");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let database = parent.join("keys.db");
+        fs::write(&database, []).unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = match open_keystore(Some(&database)) {
+            Ok(_) => panic!("unsafe database permissions must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsafe permissions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A private database inside a traversable/listable directory still
+    /// exposes keystore metadata, so the parent must also be private.
+    #[cfg(unix)]
+    #[test]
+    fn open_keystore_rejects_unsafe_existing_parent_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("shared-keystore");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let database = parent.join("keys.db");
+
+        let error = match open_keystore(Some(&database)) {
+            Ok(_) => panic!("unsafe parent permissions must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsafe permissions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Symlinks make the checked path differ from the database SQLite opens.
+    #[cfg(unix)]
+    #[test]
+    fn open_keystore_rejects_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("private-keystore");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = parent.join("target.db");
+        fs::write(&target, []).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let database = parent.join("keys.db");
+        symlink(&target, &database).unwrap();
+
+        let error = match open_keystore(Some(&database)) {
+            Ok(_) => panic!("database symlinks must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("symbolic link"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn rejects_revoked_keys_for_signing_and_encryption() {
