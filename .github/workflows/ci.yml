@@ -30,6 +30,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Verify publish actions are immutably pinned
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          workflow = pathlib.Path(".github/workflows/publish.yml")
+          invalid = []
+          for line_number, line in enumerate(workflow.read_text().splitlines(), 1):
+              match = re.match(r"^\s*(?:-\s*)?uses:\s*(\S+)", line)
+              if match and not re.fullmatch(r"[^@\s]+@[0-9a-fA-F]{40}", match.group(1)):
+                  invalid.append(f"{workflow}:{line_number}: {match.group(1)}")
+
+          if invalid:
+              raise SystemExit(
+                  "Publish workflow actions must use full commit SHAs:\n"
+                  + "\n".join(invalid)
+              )
+          PY
+
       # PC/SC stack + tools required by wecanencrypt's `card` feature.
       # pcscd actually runs (launched below with JCECARD_STORAGE_DIR) so
       # libtumpa's card paths can talk to an emulated OpenPGP card in CI.
