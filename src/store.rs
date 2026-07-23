@@ -90,7 +90,7 @@ fn validate_private_keystore_directory(path: &Path) -> Result<()> {
     if !metadata.is_dir() {
         return Err(unsafe_keystore_path(path, "parent is not a directory"));
     }
-    validate_private_keystore_metadata(path, &metadata, "directory")
+    validate_private_keystore_metadata(path, &metadata, "directory", PRIVATE_DIRECTORY_MODE)
 }
 
 /// Validate that `path` is a private regular file.
@@ -103,26 +103,67 @@ fn validate_private_keystore_database(path: &Path) -> Result<()> {
     if !metadata.is_file() {
         return Err(unsafe_keystore_path(path, "database is not a regular file"));
     }
-    validate_private_keystore_metadata(path, &metadata, "database")
+    validate_private_keystore_metadata(path, &metadata, "database", PRIVATE_DATABASE_MODE)
 }
 
-/// Validate the absence of group/other access.
+/// Validate the absence of group/other access, tightening the mode first
+/// when possible.
+///
+/// Keystores created by pre-hardening releases inherited the ambient
+/// umask (typically 0644 files in 0755 directories), so hard-failing
+/// here would break every existing install on upgrade. Instead, strip
+/// the group/other bits by resetting to `private_mode`. `chmod` only
+/// succeeds for the file's owner (or root), so this can never loosen or
+/// "repair" another user's path — anything the process cannot tighten
+/// still fails closed.
 #[cfg(unix)]
 fn validate_private_keystore_metadata(
     path: &Path,
     metadata: &std::fs::Metadata,
     kind: &str,
+    private_mode: u32,
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+
+    // The caller already rejected symlinks via symlink_metadata, so
+    // set_permissions (which follows symlinks) acts on the path it
+    // validated, up to the same stat-then-act window the surrounding
+    // checks live with.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(private_mode)).map_err(
+        |error| {
+            unsafe_keystore_path(
+                path,
+                &format!(
+                    "{kind} has unsafe permissions {mode:03o} and tightening to \
+                     {private_mode:03o} failed: {error}"
+                ),
+            )
+        },
+    )?;
+
+    // Re-read from the filesystem instead of trusting the request: some
+    // filesystems may ignore chmod or report unchanged mode bits.
+    // (Note: only the POSIX mode bits are validated here; ACLs are not checked.)
+    let tightened = std::fs::symlink_metadata(path)?.permissions().mode() & 0o777;
+    if tightened & 0o077 != 0 {
         return Err(unsafe_keystore_path(
             path,
-            &format!("{kind} has unsafe permissions {mode:03o}; group/other access is forbidden"),
+            &format!(
+                "{kind} still has unsafe permissions {tightened:03o} after tightening; \
+                 group/other access is forbidden"
+            ),
         ));
     }
 
+    log::warn!(
+        "open_keystore: tightened permissions on keystore {kind} {:?} from {mode:03o} to {private_mode:03o}",
+        path
+    );
     Ok(())
 }
 
@@ -139,9 +180,12 @@ fn unsafe_keystore_path(path: &Path, reason: &str) -> Error {
 ///
 /// Creates the parent directory and database file if they don't exist.
 /// On Unix, newly created explicitly named parent directories use `0700` and
-/// database files use `0600`; unsafe existing paths, permissions, or symlinks
-/// are rejected. A database named directly in the current directory validates
-/// only the database file, preserving the library's existing behavior.
+/// database files use `0600`. Existing paths with group/other access are
+/// tightened to those modes when the process owns them (keystores created
+/// by pre-hardening releases inherited the ambient umask); paths that
+/// cannot be tightened, symlinks, and wrong file types are rejected. A
+/// database named directly in the current directory validates only the
+/// database file, preserving the library's existing behavior.
 ///
 /// Ownership is intentionally not enforced here. The legitimate owner can be
 /// deployment-specific for service accounts, containers, and managed mounts,
@@ -579,11 +623,13 @@ mod tests {
         drop(open_keystore(Some(&database)).unwrap());
     }
 
-    /// Opening an existing database must fail closed instead of silently
-    /// accepting key material exposed to other local users.
+    /// An existing database exposed to other local users must be
+    /// tightened to 0600 on open — keystores created by pre-hardening
+    /// releases inherited the ambient umask, and rejecting them would
+    /// break every install on upgrade.
     #[cfg(unix)]
     #[test]
-    fn open_keystore_rejects_unsafe_existing_database_permissions() {
+    fn open_keystore_tightens_unsafe_existing_database_permissions() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("private-keystore");
         fs::create_dir(&parent).unwrap();
@@ -592,35 +638,27 @@ mod tests {
         fs::write(&database, []).unwrap();
         fs::set_permissions(&database, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let error = match open_keystore(Some(&database)) {
-            Ok(_) => panic!("unsafe database permissions must be rejected"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("unsafe permissions"),
-            "unexpected error: {error}"
-        );
+        drop(open_keystore(Some(&database)).unwrap());
+
+        let database_mode = fs::metadata(&database).unwrap().permissions().mode() & 0o777;
+        assert_eq!(database_mode, PRIVATE_DATABASE_MODE);
     }
 
     /// A private database inside a traversable/listable directory still
-    /// exposes keystore metadata, so the parent must also be private.
+    /// exposes keystore metadata, so the parent must be tightened too.
     #[cfg(unix)]
     #[test]
-    fn open_keystore_rejects_unsafe_existing_parent_permissions() {
+    fn open_keystore_tightens_unsafe_existing_parent_permissions() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("shared-keystore");
         fs::create_dir(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         let database = parent.join("keys.db");
 
-        let error = match open_keystore(Some(&database)) {
-            Ok(_) => panic!("unsafe parent permissions must be rejected"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("unsafe permissions"),
-            "unexpected error: {error}"
-        );
+        drop(open_keystore(Some(&database)).unwrap());
+
+        let parent_mode = fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, PRIVATE_DIRECTORY_MODE);
     }
 
     /// Symlinks make the checked path differ from the database SQLite opens.
