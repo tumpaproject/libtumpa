@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "libtumpa"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "card-backend",
