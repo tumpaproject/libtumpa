@@ -146,9 +146,9 @@ fn validate_private_keystore_metadata(
         },
     )?;
 
-    // Re-read from the filesystem instead of trusting the request: an
-    // exotic filesystem (or an ACL) can accept chmod without actually
-    // removing group/other access.
+    // Re-read from the filesystem instead of trusting the request: some
+    // filesystems may ignore chmod or report unchanged mode bits.
+    // (Note: only the POSIX mode bits are validated here; ACLs are not checked.)
     let tightened = std::fs::symlink_metadata(path)?.permissions().mode() & 0o777;
     if tightened & 0o077 != 0 {
         return Err(unsafe_keystore_path(
