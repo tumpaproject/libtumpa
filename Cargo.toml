@@ -1,6 +1,6 @@
 [package]
 name = "libtumpa"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Shared tumpa library: high-level OpenPGP key, card, and keystore operations on top of wecanencrypt."
@@ -27,20 +27,20 @@ card-mobile = ["wecanencrypt/card-external", "dep:card-backend"]
 network = ["wecanencrypt/network", "dep:reqwest", "dep:serde_json"]
 
 [dependencies]
-wecanencrypt = { version = "0.16.3", default-features = false, features = ["keystore"] }
+wecanencrypt = { version = "0.17.0", default-features = false, features = ["keystore"] }
 # Pulled in by card-mobile so MobileCardBackend can implement the
 # CardBackend / CardTransaction traits directly.
 card-backend = { version = "0.2", optional = true }
 # Pinned to the same pgp version used by wecanencrypt so that
 # DetachedSignature parsing agrees between both crates.
-pgp = "0.20"
+pgp = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 thiserror = "2"
 anyhow = "1"
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
-dirs = "6"
+dirs = "7"
 serde = { version = "1", features = ["derive"] }
 
 # Network feature deps
@@ -51,4 +51,5 @@ serde_json = { version = "1", optional = true }
 tempfile = "3"
 env_logger = "0.11"
 # Builds genuine OpenPGP revocation packets in verification regressions.
+# Keep aligned with pgp's rand 0.8 RNG traits.
 rand = "0.8"
