@@ -13,4 +13,11 @@ ignore = [
     # No fixed upstream release is available. Pulled in transitively via
     # wecanencrypt and pgp.
     "RUSTSEC-2023-0071",
+    # Temporary exception, reviewed 2026-11-07: crypto-bigint 0.5.5 has
+    # timing variability in operations intended to be constant-time.
+    # Fixed in >=0.7.6, but cx448 0.1.1 and elliptic-curve 0.13.8 require
+    # 0.5 through pgp/wecanencrypt. Remove when upstream permits a fixed
+    # version or a security backport becomes available.
+    #   https://rustsec.org/advisories/RUSTSEC-2026-0387
+    "RUSTSEC-2026-0387",
 ]
